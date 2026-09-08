@@ -22,6 +22,7 @@ function loadConfig(file, env = process.env) {
   } catch (e) {
     throw new Error(`config: invalid JSON in ${file}: ${e.message}`);
   }
+  if (!parsed || typeof parsed !== 'object') throw new Error(`config: root of ${file} must be a JSON object`);
   const cfg = {
     port: 8787,
     baseUrl: '',
@@ -53,4 +54,44 @@ function loadConfig(file, env = process.env) {
   return cfg;
 }
 
-module.exports = { loadConfig };
+function buildUpstreamPath(baseUrl, reqPath) {
+  const base = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  if (reqPath === '/v1' || reqPath.startsWith('/v1/')) {
+    return base + reqPath.slice(3); // '/v1/chat' → base + '/chat'
+  }
+  return base + reqPath;
+}
+
+function filterHeaders(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (!HOP_BY_HOP.includes(k.toLowerCase())) out[k.toLowerCase()] = v;
+  }
+  return out;
+}
+
+function createSessionManager(sessionCfg) {
+  return { cfg: sessionCfg, entries: new Map() };
+}
+
+function resolveSession(mgr, reqHeaders) {
+  if (mgr.cfg.strategy === 'static') return mgr.cfg.staticId;
+  if (mgr.cfg.strategy === 'per-request') return randomUUID();
+  const now = Date.now();
+  // 同一请求探测到的所有会话头共享同一 uuid:按 PROBE_HEADERS 顺序取首个有效 TTL 命中;否则生成新 uuid 并绑定到全部出现的头。
+  let uuid = null;
+  const seen = [];
+  for (const h of PROBE_HEADERS) {
+    const v = reqHeaders[h];
+    if (typeof v !== 'string' || !v) continue;
+    seen.push(v);
+    if (uuid !== null) continue;
+    const hit = mgr.entries.get(v);
+    if (hit && now - hit.createdAt < mgr.cfg.ttlMs) uuid = hit.uuid;
+  }
+  if (uuid === null) uuid = randomUUID();
+  for (const v of seen) mgr.entries.set(v, { uuid, createdAt: now });
+  return uuid;
+}
+
+module.exports = { loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession };

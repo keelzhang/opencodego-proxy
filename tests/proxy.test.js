@@ -380,3 +380,36 @@ test('cleanupSessionMap: 未达 ttlMs 的条目保留(< 边界不清理)', () =>
   assert.equal(removed, 0);
   assert.ok(m.entries.has('keep'));
 });
+
+// ---------- 最终审查修复轮 ----------
+
+test('客户端断连 → 中止上游请求', async (t) => {
+  let upstreamAborted = false;
+  // 假上游:SSE 流写完首个事件后保持打开(不 end)。
+  // 判定"上游被中止"的直接信号:rs 在 writableFinished === false 时触发 'close',
+  // 即响应未写完连接就被终止;正常完成时 writableFinished === true,不会误报。
+  const up = await startFakeUpstream((rq, rs) => {
+    rs.writeHead(200, { 'content-type': 'text/event-stream' });
+    rs.write('data: {"a":1}\n\n');
+    rs.on('close', () => { if (!rs.writableFinished) upstreamAborted = true; });
+  });
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}/v4`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  // 上游响应故意不 end,残留连接需先强制断开,否则 close() 会等待连接结束而挂起
+  t.after(() => {
+    p.srv.closeAllConnections();
+    up.srv.closeAllConnections();
+    return Promise.all([closeSrv(p.srv), closeSrv(up.srv)]);
+  });
+  // 客户端发起请求,收到第一个数据块后立即断连(等价 Cursor 中按 Esc 停止生成)
+  await new Promise((resolve) => {
+    const r = http.request({ host: '127.0.0.1', port: p.port, method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'abort-1' } }, (res) => {
+      res.once('data', () => { r.destroy(); resolve(); });
+      res.on('error', () => resolve());
+    });
+    r.on('error', () => resolve());
+    r.end('{}');
+  });
+  // 轮询等待代理把断连传播到上游(本地 loopback 通常几十毫秒内)
+  for (let i = 0; i < 50 && !upstreamAborted; i++) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(upstreamAborted, true, 'upstream request should be aborted after client disconnect');
+});

@@ -1,0 +1,8 @@
+{
+  "name": "cursor-opencode-proxy",
+  "name$comment": "single-file zero-dependency local proxy",
+  "scripts": {
+    "test": "node --test tests/*.js"
+  },
+  "private": true
+}

@@ -1,0 +1,7 @@
+# 本地私密配置(含 apiKey),参考 config.example.json
+config.json
+
+# 运行期临时文件
+*.log
+node_modules/
+__pycache__/

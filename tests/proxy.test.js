@@ -281,6 +281,7 @@ test('log.headers=true 打印脱敏请求头;log.body=true 打印 body 前 2KB',
   assert.ok(all.includes('log-1'));
   assert.ok(!all.includes('cursor-key'));
   assert.ok(all.includes('{"q":1}'));
+  assert.ok(all.includes('upstream=200')); // 规格 5.5:每请求一行含上游状态码
 });
 
 // ---------- 质量审查修复轮 ----------
@@ -361,12 +362,21 @@ test('applyHotConfig: 合法新配置替换,非法新配置保留旧配置并保
 });
 
 test('cleanupSessionMap: 仅清理过期条目并返回数量', () => {
-  const m = proxy.createSessionManager({ strategy: 'auto', header: 'h', staticId: 'sid', ttlMs: 50 });
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'h', staticId: 'sid', ttlMs: 1000 });
   proxy.resolveSession(m, { 'x-session-id': 'fresh' });
   proxy.resolveSession(m, { 'x-session-id': 'old' });
-  m.entries.get('old').createdAt -= 1000;
+  m.entries.get('old').createdAt -= 1000; // 恰为 ttlMs:now-createdAt >= ttlMs,删除(边界语义固化)
   const removed = proxy.cleanupSessionMap(m);
   assert.equal(removed, 1);
   assert.ok(m.entries.has('fresh'));
   assert.ok(!m.entries.has('old'));
+});
+
+test('cleanupSessionMap: 未达 ttlMs 的条目保留(< 边界不清理)', () => {
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'h', staticId: 'sid', ttlMs: 1000 });
+  proxy.resolveSession(m, { 'x-session-id': 'keep' });
+  m.entries.get('keep').createdAt -= 1000 - 100; // now-createdAt < ttlMs:保留
+  const removed = proxy.cleanupSessionMap(m);
+  assert.equal(removed, 0);
+  assert.ok(m.entries.has('keep'));
 });

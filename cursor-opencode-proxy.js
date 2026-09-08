@@ -180,6 +180,7 @@ function proxyRequest(req, res, hot) {
         headers,
         timeout: UPSTREAM_TIMEOUT_MS,
       }, (upRes) => {
+        console.log(`${new Date().toISOString()} ${req.method} ${req.url} upstream=${upRes.statusCode}`); // 规格 5.5:每请求一行上游状态
         res.writeHead(upRes.statusCode, filterHeaders(upRes.headers));
         upRes.pipe(res); // 纯透传:不缓冲、不解析、不重组
         upRes.on('error', () => res.destroy());
@@ -241,13 +242,19 @@ function watchConfig(file, onChange) {
     clearTimeout(timer);
     timer = setTimeout(() => onChange(file), CONFIG_DEBOUNCE_MS);
   });
+  watcher.on('error', (e) => console.warn(`[hot-reload] watcher error: ${e.message}`)); // 配置文件消失等场景退化为告警,而非未捕获异常崩溃
   return watcher;
 }
 
 function main() {
   const configFile = path.join(__dirname, 'config.json');
   if (!fs.existsSync(configFile)) {
-    fs.copyFileSync(path.join(__dirname, 'config.example.json'), configFile);
+    try {
+      fs.copyFileSync(path.join(__dirname, 'config.example.json'), configFile);
+    } catch (e) {
+      console.error(`config: cannot copy template: ${e.message}`);
+      process.exit(1);
+    }
     console.error(`config.json not found - template copied. Edit ${configFile} (set baseUrl/apiKey), then restart.`);
     process.exit(1);
   }
@@ -264,12 +271,18 @@ function main() {
     console.log(`cursor-opencode-proxy listening on http://127.0.0.1:${cfg.port} (Cursor Base URL: http://127.0.0.1:${cfg.port}/v1)`);
     console.log(`upstream: ${cfg.baseUrl} | session: ${cfg.session.strategy} via header "${cfg.session.header}"`);
   });
-  srv.on('error', (e) => { console.error(`listen failed: ${e.message}`); process.exit(1); });
+  srv.on('error', (e) => {
+    console.error(`listen failed: ${e.message} (change port in config.json or COP_PORT env)`);
+    process.exit(1);
+  });
   watchConfig(configFile, () => {
     const r = applyHotConfig(hot, configFile);
     if (r.ok) console.log(`[hot-reload] applied: baseUrl=${r.config.baseUrl} session=${r.config.session.strategy} (port change requires restart)`);
   });
-  setInterval(() => cleanupSessionMap(hot.sessionMgr), SESSION_GC_INTERVAL_MS).unref();
+  setInterval(() => {
+    const n = cleanupSessionMap(hot.sessionMgr);
+    if (n) console.log(`[gc] removed ${n} expired session entries`);
+  }, SESSION_GC_INTERVAL_MS).unref();
 }
 
 if (require.main === module) main();

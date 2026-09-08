@@ -16,7 +16,7 @@ OpenCode 的 Go 后端在 2025-09-05 左右启用了**强制 session routing**:�
 
 - Windows 下运行:`node cursor-opencode-proxy.js` 即可启动,无需 `npm install`
 - 支持 SSE streaming:响应逐字节透传,不缓冲、不解析、不重组
-- 自动 session 管理:同一 Cursor 会话复用同一个注入的 `x-opencode-session`,新会话生成新 UUID
+- 自动 session 管理(默认 `auto` 策略):同一 Cursor 会话复用同一个注入的 `x-opencode-session`,新会话生成新 UUID;`per-request`/`static` 策略行为见 5.2
 - Cursor 侧只需把 Base URL 改为 `http://127.0.0.1:<port>/v1`,零其他配置
 - 上游可配置:任意 OpenAI 兼容端点(baseUrl + apiKey),换供应商不改代码
 - 配置热重载:修改 `config.json` 保存即生效,无需重启进程
@@ -85,7 +85,7 @@ Cursor 版本迭代快,会话头名可能变化;`log.headers: true` 时首次连
 ### 5.3 SSE 流式透传
 
 - 响应侧不做任何缓冲:上游响应到达即通过 `pipe` 回写客户端,Node 默认不缓冲 socket 写入
-- 回写上游响应头,但过滤 hop-by-hop 头:`connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`te`、`trailer`、`transfer-encoding`、`upgrade`(Node 的 `http.request` 已自行管理其中的连接管理类头)
+- 回写上游响应头,但显式过滤 hop-by-hop 头(小写匹配):`connection`、`keep-alive`、`proxy-authenticate`、`proxy-authorization`、`te`、`trailer`、`transfer-encoding`、`upgrade`;`content-length` 由 Node 按实际转发字节自动重算,不在回写列表内(流式响应无此头,不受影响)
 - 客户端断连(Cursor 中断生成):立即 `destroy` 到上游的请求,不悬挂
 
 ### 5.4 错误处理
@@ -94,7 +94,7 @@ Cursor 版本迭代快,会话头名可能变化;`log.headers: true` 时首次连
 |---|---|
 | 上游连接失败/DNS 失败/超时(60s 连接超时) | 返回 502 + OpenAI 错误格式 JSON:`{"error":{"message":"...","type":"proxy_error"}}`,Cursor 能正常显示报错 |
 | 上游返回 4xx/5xx | 状态码与 body 原样透传 |
-| 上游 4xx 且日志提示疑似缺 session 头 | 醒目日志提示检查 `x-opencode-session` 注入(session routing 拒绝的典型表现) |
+| 上游 4xx 且满足以下任一条件时,醒目日志提示检查 `x-opencode-session` 注入(session routing 拒绝的典型表现):响应 body 含 `session`(不区分大小写)字样,或状态码为 400/401/403 | 原样透传 + 提示日志 |
 | `config.json` 非法 JSON/缺失必填字段 | 热重载时保留旧配置并告警;启动时生成模板后退出 |
 | 端口被占用 | 明确报错退出(提示修改 port) |
 | 请求 body 超过 10MB | 返回 413 |
@@ -114,7 +114,7 @@ Cursor 版本迭代快,会话头名可能变化;`log.headers: true` 时首次连
 
 ## 6. 配置文件
 
-`config.json`(与脚本同目录),环境变量 `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` 可覆盖对应字段:
+`config.json`(与脚本同目录),环境变量 `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` 可覆盖对应字段。环境变量在每次(重)加载配置时重新读取,即热重载后环境变量覆盖依然生效:
 
 ```json
 {

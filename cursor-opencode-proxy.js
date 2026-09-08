@@ -7,7 +7,7 @@ const { randomUUID } = require('node:crypto');
 
 const STRATEGIES = ['auto', 'per-request', 'static'];
 const PROBE_HEADERS = ['x-session-id', 'x-client-session-id', 'x-request-id'];
-const HOP_BY_HOP = ['host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
+const HOP_BY_HOP = ['host', 'connection', 'keep-alive', 'expect', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']; // expect: Node 上游请求不会自动发 100 Continue,透传会令上游挂起
 
 function loadConfig(file, env = process.env) {
   let raw;
@@ -40,9 +40,22 @@ function loadConfig(file, env = process.env) {
   if (typeof env.COP_PORT === 'string' && /^\d+$/.test(env.COP_PORT) && +env.COP_PORT > 0 && +env.COP_PORT < 65536) cfg.port = +env.COP_PORT;
   if (typeof env.COP_BASE_URL === 'string' && env.COP_BASE_URL) cfg.baseUrl = env.COP_BASE_URL.replace(/\/+$/, '');
   if (typeof env.COP_API_KEY === 'string' && env.COP_API_KEY) cfg.apiKey = env.COP_API_KEY;
+  // baseUrl 双入口(文件/环境变量)的最终值统一校验:非法或协议不在 http(s) 白名单,启动即拒绝。
+  let baseUrlValid = true;
+  try {
+    const u = new URL(cfg.baseUrl);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') baseUrlValid = false;
+  } catch { baseUrlValid = false; }
+  if (!baseUrlValid) throw new Error(`config: invalid baseUrl: ${JSON.stringify(cfg.baseUrl)} (must be an absolute http/https URL)`);
   if (parsed.session && typeof parsed.session === 'object') {
     if (typeof parsed.session.header === 'string' && parsed.session.header) cfg.session.header = parsed.session.header;
+    if (!/^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(cfg.session.header)) {
+      throw new Error(`config: invalid session.header: ${JSON.stringify(cfg.session.header)} (must be an HTTP field-name token)`);
+    }
     if (typeof parsed.session.staticId === 'string' && parsed.session.staticId) cfg.session.staticId = parsed.session.staticId;
+    if (!cfg.session.staticId || !cfg.session.staticId.trim()) {
+      throw new Error(`config: invalid session.staticId: ${JSON.stringify(cfg.session.staticId)} (must be non-empty)`);
+    }
     if (Number.isInteger(parsed.session.ttlMs) && parsed.session.ttlMs > 0) cfg.session.ttlMs = parsed.session.ttlMs;
     if (STRATEGIES.includes(parsed.session.strategy)) cfg.session.strategy = parsed.session.strategy;
     else throw new Error(`config: invalid session.strategy: ${JSON.stringify(parsed.session.strategy)} (allowed: ${STRATEGIES.join(', ')})`);
@@ -141,7 +154,8 @@ function proxyRequest(req, res, hot) {
     if (size > MAX_BODY) {
       rejected = true;
       sendOpenAIError(res, 413, 'request body too large (proxy limit 10MB)');
-      req.destroy();
+      req.pause(); // 停止缓冲剩余 body,让客户端先读完 413 错误体,避免立即 destroy 造成 RST
+      res.on('close', () => req.destroy()); // 响应结束后统一中止请求流
       return;
     }
     chunks.push(c);
@@ -150,41 +164,46 @@ function proxyRequest(req, res, hot) {
   req.on('end', () => {
     if (rejected) return;
     const body = Buffer.concat(chunks);
-    const sessionId = resolveSession(hot.sessionMgr, req.headers);
-    logRequest(cfg, req, sessionId);
-    if (cfg.log.body) console.log('  body[0:2048]:', body.toString('utf8', 0, 2048));
-    const headers = filterHeaders(req.headers);
-    delete headers['content-length']; // Node 按实际转发字节自动设置
-    delete headers['host'];           // Node 按 baseUrl 自动设置上游 host
-    headers['authorization'] = `Bearer ${cfg.apiKey}`;
-    headers[cfg.session.header] = sessionId;
-    const mod = cfg.baseUrl.startsWith('https:') ? https : http;
-    const upReq = mod.request(cfg.baseUrl, {
-      method: req.method,
-      path: buildUpstreamPath(cfg.baseUrl, req.url),
-      headers,
-      timeout: UPSTREAM_TIMEOUT_MS,
-    }, (upRes) => {
-      res.writeHead(upRes.statusCode, filterHeaders(upRes.headers));
-      upRes.pipe(res); // 纯透传:不缓冲、不解析、不重组
-      upRes.on('error', () => res.destroy());
-      if (SESSION_HINT_STATUS.has(upRes.statusCode)) {
-        console.warn(`[hint] upstream ${upRes.statusCode}: check ${cfg.session.header} injection / upstream session routing (spec 5.4)`);
-      }
-    });
-    upReq.on('timeout', () => {
-      sendOpenAIError(res, 504, `upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`);
-      upReq.destroy();
-    });
-    upReq.on('error', (e) => {
-      if (!res.headersSent) sendOpenAIError(res, 502, `upstream request failed: ${e.message}`);
-      else res.destroy();
-    });
-    res.on('close', () => {
-      if (!res.writableEnded) upReq.destroy(); // 客户端断连 → 中止上游
-    });
-    if (body.length) upReq.write(body);
-    upReq.end();
+    try {
+      const sessionId = resolveSession(hot.sessionMgr, req.headers);
+      logRequest(cfg, req, sessionId);
+      if (cfg.log.body) console.log('  body[0:2048]:', body.toString('utf8', 0, 2048));
+      const headers = filterHeaders(req.headers);
+      delete headers['content-length']; // Node 按实际转发字节自动设置
+      delete headers['host'];           // Node 按 baseUrl 自动设置上游 host
+      headers['authorization'] = `Bearer ${cfg.apiKey}`;
+      headers[cfg.session.header] = sessionId;
+      const mod = cfg.baseUrl.startsWith('https:') ? https : http;
+      const upReq = mod.request(cfg.baseUrl, {
+        method: req.method,
+        path: buildUpstreamPath(cfg.baseUrl, req.url),
+        headers,
+        timeout: UPSTREAM_TIMEOUT_MS,
+      }, (upRes) => {
+        res.writeHead(upRes.statusCode, filterHeaders(upRes.headers));
+        upRes.pipe(res); // 纯透传:不缓冲、不解析、不重组
+        upRes.on('error', () => res.destroy());
+        if (SESSION_HINT_STATUS.has(upRes.statusCode)) {
+          console.warn(`[hint] upstream ${upRes.statusCode}: check ${cfg.session.header} injection / upstream session routing (spec 5.4)`);
+        }
+      });
+      upReq.on('timeout', () => {
+        sendOpenAIError(res, 504, `upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`);
+        upReq.destroy();
+      });
+      upReq.on('error', (e) => {
+        if (!res.headersSent) sendOpenAIError(res, 502, `upstream request failed: ${e.message}`);
+        else res.destroy();
+      });
+      res.on('close', () => {
+        if (!res.writableEnded) upReq.destroy(); // 客户端断连 → 中止上游
+      });
+      if (body.length) upReq.write(body);
+      upReq.end();
+    } catch (e) {
+      // 同步段兜底(如非法 baseUrl):不让异常逸出崩溃进程,统一转 502 OpenAI 错误格式。
+      sendOpenAIError(res, 502, `upstream request failed: ${e.message}`);
+    }
   });
 }
 

@@ -175,6 +175,8 @@ function req(port, opts, body) {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+      res.on('aborted', () => reject(new Error(`client response aborted (status=${res.statusCode}, bytes=${Buffer.concat(chunks).length})`)));
+      res.on('error', reject);
     });
     r.on('error', reject);
     if (body) r.write(body);
@@ -182,7 +184,7 @@ function req(port, opts, body) {
   });
 }
 
-test('proxyRequest: 换 Authorization、注入 session、透传 body 与路径', async () => {
+test('proxyRequest: 换 Authorization、注入 session、透传 body 与路径', async (t) => {
   let seen = null;
   const up = await startFakeUpstream((rq, rs) => {
     seen = { url: rq.url, auth: rq.headers.authorization, session: rq.headers['x-opencode-session'], host: rq.headers.host, body: '' };
@@ -190,6 +192,8 @@ test('proxyRequest: 换 Authorization、注入 session、透传 body 与路径',
     rq.on('end', () => { rs.writeHead(200, { 'content-type': 'application/json' }); rs.end('{"ok":true}'); });
   });
   const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}/v4`, apiKey: 'up-key', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
   const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer cursor-key', 'x-session-id': 'cur-1' } }, '{"model":"glm-4.6","messages":[]}');
   assert.equal(res.status, 200);
   assert.deepEqual(JSON.parse(res.body), { ok: true });
@@ -198,10 +202,9 @@ test('proxyRequest: 换 Authorization、注入 session、透传 body 与路径',
   assert.ok(/^[0-9a-f-]{36}$/.test(seen.session));
   assert.equal(seen.host, `127.0.0.1:${up.port}`);
   assert.equal(seen.body, '{"model":"glm-4.6","messages":[]}');
-  await closeSrv(p.srv); await closeSrv(up.srv);
 });
 
-test('SSE 透传:多个 chunk 顺序完整到达', async () => {
+test('SSE 透传:多个 chunk 顺序完整到达', async (t) => {
   const up = await startFakeUpstream((rq, rs) => {
     rs.writeHead(200, { 'content-type': 'text/event-stream' });
     rs.write('data: {"a":1}\n\n');
@@ -209,63 +212,67 @@ test('SSE 透传:多个 chunk 顺序完整到达', async () => {
     setTimeout(() => rs.end('data: [DONE]\n\n'), 60);
   });
   const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}/v4`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
   const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'sse-1' } }, '{}');
   assert.equal(res.status, 200);
   assert.equal(res.headers['content-type'], 'text/event-stream');
   const events = res.body.split('\n\n').filter(Boolean);
   assert.deepEqual(events, ['data: {"a":1}', 'data: {"a":2}', 'data: [DONE]']);
-  await closeSrv(p.srv); await closeSrv(up.srv);
 });
 
-test('同一 Cursor 会话复用同一注入 UUID,新会话新 UUID', async () => {
+test('同一 Cursor 会话复用同一注入 UUID,新会话新 UUID', async (t) => {
   const sessions = [];
   const up = await startFakeUpstream((rq, rs) => { sessions.push(rq.headers['x-opencode-session']); rs.end('ok'); });
   const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
   await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'same' } }, '{}');
   await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'same' } }, '{}');
   await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'other' } }, '{}');
   assert.equal(sessions[0], sessions[1]);
   assert.notEqual(sessions[2], sessions[0]);
-  await closeSrv(p.srv); await closeSrv(up.srv);
 });
 
-test('上游连接失败 → 502 + OpenAI 错误格式', async () => {
+test('上游连接失败 → 502 + OpenAI 错误格式', async (t) => {
   const dead = await getDeadPort();
   const p = await startProxy({ baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
   const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
   assert.equal(res.status, 502);
   const parsed = JSON.parse(res.body);
   assert.equal(parsed.error.type, 'proxy_error');
   assert.ok(parsed.error.message);
-  await closeSrv(p.srv);
 });
 
-test('上游 4xx/5xx 原样透传', async () => {
+test('上游 4xx/5xx 原样透传', async (t) => {
   const up = await startFakeUpstream((rq, rs) => { rs.writeHead(429, { 'content-type': 'application/json' }); rs.end('{"error":{"message":"rate limited","type":"rate_limit"}}'); });
   const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
   const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
   assert.equal(res.status, 429);
   assert.equal(JSON.parse(res.body).error.type, 'rate_limit');
-  await closeSrv(p.srv); await closeSrv(up.srv);
 });
 
-test('body 超过 10MB → 413,不触碰上游', async () => {
+test('body 超过 10MB → 413,不触碰上游', async (t) => {
   const dead = await getDeadPort();
   const p = await startProxy({ baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
   const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, 'x'.repeat(10 * 1024 * 1024 + 1));
   assert.equal(res.status, 413);
-  await closeSrv(p.srv);
 });
 
-test('log.headers=true 打印脱敏请求头;log.body=true 打印 body 前 2KB', async () => {
+test('log.headers=true 打印脱敏请求头;log.body=true 打印 body 前 2KB', async (t) => {
   const logs = [];
   const orig = console.log;
   console.log = (...a) => logs.push(a.join(' '));
   try {
     const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
     const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'up-key', session: VALID.session, log: { headers: true, body: true } });
+    t.after(() => closeSrv(p.srv));
+    t.after(() => closeSrv(up.srv));
     await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer cursor-key', 'x-session-id': 'log-1' } }, '{"q":1}');
-    await closeSrv(p.srv); await closeSrv(up.srv);
   } finally {
     console.log = orig;
   }
@@ -274,4 +281,61 @@ test('log.headers=true 打印脱敏请求头;log.body=true 打印 body 前 2KB',
   assert.ok(all.includes('log-1'));
   assert.ok(!all.includes('cursor-key'));
   assert.ok(all.includes('{"q":1}'));
+});
+
+// ---------- 质量审查修复轮 ----------
+
+test('loadConfig: 非法 baseUrl 抛出 invalid baseUrl(启动即拒绝)', () => {
+  assert.throws(() => proxy.loadConfig(makeConfigFile({ baseUrl: 'not a url', apiKey: 'k' }), {}), /invalid baseUrl/);
+});
+
+test('loadConfig: baseUrl 协议白名单 http:/https:,其他协议抛出 invalid baseUrl', () => {
+  assert.throws(() => proxy.loadConfig(makeConfigFile({ baseUrl: 'ftp://x', apiKey: 'k' }), {}), /invalid baseUrl/);
+});
+
+test('loadConfig: 环境变量覆盖后的非法 baseUrl 同样抛出(两入口最终值均校验)', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID }), { COP_BASE_URL: 'not a url' }),
+    /invalid baseUrl/,
+  );
+});
+
+test('loadConfig: session.header 非法(含空格)抛出错误', () => {
+  const bad = { ...VALID, session: { ...VALID.session, header: 'bad header' } };
+  assert.throws(() => proxy.loadConfig(makeConfigFile(bad), {}), /session\.header/);
+});
+
+test('loadConfig: staticId 为空白抛出错误', () => {
+  const bad = { ...VALID, session: { ...VALID.session, staticId: ' ' } };
+  assert.throws(() => proxy.loadConfig(makeConfigFile(bad), {}), /staticId/);
+});
+
+test('filterHeaders: Expect: 100-continue 被过滤(避免上游等待 100 Continue 挂起)', () => {
+  const out = proxy.filterHeaders({ Expect: '100-continue', 'content-type': 'a' });
+  assert.equal(out.expect, undefined);
+  assert.equal(out['content-type'], 'a');
+});
+
+test('非法 baseUrl 启动不崩,首个请求得到 502 + proxy_error JSON', async (t) => {
+  const p = await startProxy({ baseUrl: 'not a url', apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 502);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.error.type, 'proxy_error');
+  assert.ok(parsed.error.message);
+});
+
+test('baseUrl 带 query 时转发 path 不含该 query(固化 Node options.path 整段替换行为,防版本回归)', async (t) => {
+  let seen = null;
+  const up = await startFakeUpstream((rq, rs) => {
+    seen = { url: rq.url };
+    rs.end('ok');
+  });
+  t.after(() => closeSrv(up.srv));
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}/v4?api-key=SECRET`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(seen.url, '/v4/chat/completions');
+  assert.ok(!seen.url.includes('SECRET'));
 });

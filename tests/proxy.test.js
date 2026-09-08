@@ -144,3 +144,134 @@ test('resolveSession: ttlMs=1 同毫秒内命中复用', () => {
   const v2 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
   assert.equal(v1, v2);
 });
+
+// ---------- 任务 3:转发器与服务(端到端) ----------
+
+const http = require('node:http');
+
+function startFakeUpstream(handler) {
+  return new Promise((resolve) => {
+    const srv = http.createServer(handler);
+    srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port }));
+  });
+}
+async function getDeadPort() {
+  const s = http.createServer();
+  await new Promise((r) => s.listen(0, '127.0.0.1', r));
+  const port = s.address().port;
+  await new Promise((r) => s.close(r));
+  return port;
+}
+function closeSrv(srv) { return new Promise((r) => srv.close(() => r())); }
+function startProxy(cfg) {
+  return new Promise((resolve) => {
+    const srv = proxy.createServer(proxy.createHotReloader(cfg));
+    srv.listen(0, '127.0.0.1', () => resolve({ srv, port: srv.address().port }));
+  });
+}
+function req(port, opts, body) {
+  return new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port, ...opts }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    r.on('error', reject);
+    if (body) r.write(body);
+    r.end();
+  });
+}
+
+test('proxyRequest: 换 Authorization、注入 session、透传 body 与路径', async () => {
+  let seen = null;
+  const up = await startFakeUpstream((rq, rs) => {
+    seen = { url: rq.url, auth: rq.headers.authorization, session: rq.headers['x-opencode-session'], host: rq.headers.host, body: '' };
+    rq.on('data', (c) => (seen.body += c));
+    rq.on('end', () => { rs.writeHead(200, { 'content-type': 'application/json' }); rs.end('{"ok":true}'); });
+  });
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}/v4`, apiKey: 'up-key', session: VALID.session, log: { headers: false, body: false } });
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer cursor-key', 'x-session-id': 'cur-1' } }, '{"model":"glm-4.6","messages":[]}');
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.body), { ok: true });
+  assert.equal(seen.url, '/v4/chat/completions');
+  assert.equal(seen.auth, 'Bearer up-key');
+  assert.ok(/^[0-9a-f-]{36}$/.test(seen.session));
+  assert.equal(seen.host, `127.0.0.1:${up.port}`);
+  assert.equal(seen.body, '{"model":"glm-4.6","messages":[]}');
+  await closeSrv(p.srv); await closeSrv(up.srv);
+});
+
+test('SSE 透传:多个 chunk 顺序完整到达', async () => {
+  const up = await startFakeUpstream((rq, rs) => {
+    rs.writeHead(200, { 'content-type': 'text/event-stream' });
+    rs.write('data: {"a":1}\n\n');
+    setTimeout(() => rs.write('data: {"a":2}\n\n'), 30);
+    setTimeout(() => rs.end('data: [DONE]\n\n'), 60);
+  });
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}/v4`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'sse-1' } }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(res.headers['content-type'], 'text/event-stream');
+  const events = res.body.split('\n\n').filter(Boolean);
+  assert.deepEqual(events, ['data: {"a":1}', 'data: {"a":2}', 'data: [DONE]']);
+  await closeSrv(p.srv); await closeSrv(up.srv);
+});
+
+test('同一 Cursor 会话复用同一注入 UUID,新会话新 UUID', async () => {
+  const sessions = [];
+  const up = await startFakeUpstream((rq, rs) => { sessions.push(rq.headers['x-opencode-session']); rs.end('ok'); });
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'same' } }, '{}');
+  await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'same' } }, '{}');
+  await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-session-id': 'other' } }, '{}');
+  assert.equal(sessions[0], sessions[1]);
+  assert.notEqual(sessions[2], sessions[0]);
+  await closeSrv(p.srv); await closeSrv(up.srv);
+});
+
+test('上游连接失败 → 502 + OpenAI 错误格式', async () => {
+  const dead = await getDeadPort();
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 502);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.error.type, 'proxy_error');
+  assert.ok(parsed.error.message);
+  await closeSrv(p.srv);
+});
+
+test('上游 4xx/5xx 原样透传', async () => {
+  const up = await startFakeUpstream((rq, rs) => { rs.writeHead(429, { 'content-type': 'application/json' }); rs.end('{"error":{"message":"rate limited","type":"rate_limit"}}'); });
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 429);
+  assert.equal(JSON.parse(res.body).error.type, 'rate_limit');
+  await closeSrv(p.srv); await closeSrv(up.srv);
+});
+
+test('body 超过 10MB → 413,不触碰上游', async () => {
+  const dead = await getDeadPort();
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, 'x'.repeat(10 * 1024 * 1024 + 1));
+  assert.equal(res.status, 413);
+  await closeSrv(p.srv);
+});
+
+test('log.headers=true 打印脱敏请求头;log.body=true 打印 body 前 2KB', async () => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+    const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'up-key', session: VALID.session, log: { headers: true, body: true } });
+    await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer cursor-key', 'x-session-id': 'log-1' } }, '{"q":1}');
+    await closeSrv(p.srv); await closeSrv(up.srv);
+  } finally {
+    console.log = orig;
+  }
+  const all = logs.join('\n');
+  assert.ok(all.includes('x-session-id'));
+  assert.ok(all.includes('log-1'));
+  assert.ok(!all.includes('cursor-key'));
+  assert.ok(all.includes('{"q":1}'));
+});

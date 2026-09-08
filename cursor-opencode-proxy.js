@@ -7,7 +7,7 @@ const { randomUUID } = require('node:crypto');
 
 const STRATEGIES = ['auto', 'per-request', 'static'];
 const PROBE_HEADERS = ['x-session-id', 'x-client-session-id', 'x-request-id'];
-const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
+const HOP_BY_HOP = ['host', 'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
 
 function loadConfig(file, env = process.env) {
   let raw;
@@ -55,9 +55,14 @@ function loadConfig(file, env = process.env) {
 }
 
 function buildUpstreamPath(baseUrl, reqPath) {
-  const base = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  let base;
+  try {
+    base = new URL(baseUrl).pathname.replace(/\/+$/, '');
+  } catch (e) {
+    throw new Error(`upstream path: invalid baseUrl: ${JSON.stringify(baseUrl)}: ${e.message}`);
+  }
   if (reqPath === '/v1' || reqPath.startsWith('/v1/')) {
-    return base + reqPath.slice(3); // '/v1/chat' → base + '/chat'
+    return base + reqPath.slice('/v1'.length); // '/v1/chat' → base + '/chat'
   }
   return base + reqPath;
 }

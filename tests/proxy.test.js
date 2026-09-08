@@ -124,3 +124,23 @@ test('resolveSession: TTL 过期后同 key 生成新 UUID', () => {
   const v2 = proxy.resolveSession(m, { 'x-session-id': 's9' });
   assert.notEqual(v1, v2);
 });
+
+test('filterHeaders: host 头被过滤(由 Node 按上游自动生成)', () => {
+  const out = proxy.filterHeaders({ Host: 'localhost:8787', 'content-type': 'application/json' });
+  assert.deepEqual(out, { 'content-type': 'application/json' });
+});
+
+test('buildUpstreamPath: 无效 baseUrl 抛出带上下文的错误', () => {
+  assert.throws(() => proxy.buildUpstreamPath('not a url', '/v1/chat'), /invalid baseUrl/);
+});
+
+test('buildUpstreamPath: reqPath 恰为 /v1 时前缀整段移除(固化 slice 语义)', () => {
+  assert.equal(proxy.buildUpstreamPath('https://api.example.com/v4', '/v1'), '/v4');
+});
+
+test('resolveSession: ttlMs=1 同毫秒内命中复用', () => {
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'x-opencode-session', staticId: 'sid', ttlMs: 1 });
+  const v1 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
+  const v2 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
+  assert.equal(v1, v2);
+});

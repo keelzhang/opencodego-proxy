@@ -211,7 +211,70 @@ function createServer(hot) {
   return http.createServer((rq, rs) => proxyRequest(rq, rs, hot));
 }
 
+const CONFIG_DEBOUNCE_MS = 300;
+const SESSION_GC_INTERVAL_MS = 3600000;
+
+function applyHotConfig(hot, file) {
+  try {
+    const next = loadConfig(file, process.env);
+    hot.config = next;
+    hot.sessionMgr.cfg = next.session; // session 策略/头名/TTL 热更新,映射保留
+    return { ok: true, config: next };
+  } catch (e) {
+    console.warn(`[hot-reload] keep old config: ${e.message}`);
+    return { ok: false, error: e.message };
+  }
+}
+
+function cleanupSessionMap(mgr) {
+  const now = Date.now();
+  let removed = 0;
+  for (const [k, v] of mgr.entries) {
+    if (now - v.createdAt >= mgr.cfg.ttlMs) { mgr.entries.delete(k); removed++; }
+  }
+  return removed;
+}
+
+function watchConfig(file, onChange) {
+  let timer = null;
+  const watcher = fs.watch(file, () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => onChange(file), CONFIG_DEBOUNCE_MS);
+  });
+  return watcher;
+}
+
+function main() {
+  const configFile = path.join(__dirname, 'config.json');
+  if (!fs.existsSync(configFile)) {
+    fs.copyFileSync(path.join(__dirname, 'config.example.json'), configFile);
+    console.error(`config.json not found - template copied. Edit ${configFile} (set baseUrl/apiKey), then restart.`);
+    process.exit(1);
+  }
+  let cfg;
+  try {
+    cfg = loadConfig(configFile, process.env);
+  } catch (e) {
+    console.error(e.message);
+    process.exit(1);
+  }
+  const hot = createHotReloader(cfg);
+  const srv = createServer(hot);
+  srv.listen(cfg.port, '127.0.0.1', () => {
+    console.log(`cursor-opencode-proxy listening on http://127.0.0.1:${cfg.port} (Cursor Base URL: http://127.0.0.1:${cfg.port}/v1)`);
+    console.log(`upstream: ${cfg.baseUrl} | session: ${cfg.session.strategy} via header "${cfg.session.header}"`);
+  });
+  srv.on('error', (e) => { console.error(`listen failed: ${e.message}`); process.exit(1); });
+  watchConfig(configFile, () => {
+    const r = applyHotConfig(hot, configFile);
+    if (r.ok) console.log(`[hot-reload] applied: baseUrl=${r.config.baseUrl} session=${r.config.session.strategy} (port change requires restart)`);
+  });
+  setInterval(() => cleanupSessionMap(hot.sessionMgr), SESSION_GC_INTERVAL_MS).unref();
+}
+
+if (require.main === module) main();
+
 module.exports = {
   loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession,
-  createHotReloader, proxyRequest, createServer,
+  createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
 };

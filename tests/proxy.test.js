@@ -339,3 +339,34 @@ test('baseUrl 带 query 时转发 path 不含该 query(固化 Node options.path 
   assert.equal(seen.url, '/v4/chat/completions');
   assert.ok(!seen.url.includes('SECRET'));
 });
+
+// ---------- 任务 4:热重载与清理 ----------
+
+test('applyHotConfig: 合法新配置替换,非法新配置保留旧配置并保持 session 映射', () => {
+  const file = makeConfigFile(VALID);
+  const hot = proxy.createHotReloader(proxy.loadConfig(file, {}));
+  proxy.resolveSession(hot.sessionMgr, { 'x-session-id': 'keep-me' });
+  const uuidBefore = hot.sessionMgr.entries.get('keep-me').uuid;
+
+  const bad = proxy.applyHotConfig(hot, writeTmp(JSON.stringify({ baseUrl: '', apiKey: 'x' })));
+  assert.equal(bad.ok, false);
+  assert.equal(hot.config.baseUrl, VALID.baseUrl);
+  assert.equal(hot.sessionMgr.entries.get('keep-me').uuid, uuidBefore);
+
+  const changed = { ...VALID, apiKey: 'new-key' };
+  const good = proxy.applyHotConfig(hot, makeConfigFile(changed));
+  assert.equal(good.ok, true);
+  assert.equal(hot.config.apiKey, 'new-key');
+  assert.equal(hot.sessionMgr.cfg.ttlMs, VALID.session.ttlMs);
+});
+
+test('cleanupSessionMap: 仅清理过期条目并返回数量', () => {
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'h', staticId: 'sid', ttlMs: 50 });
+  proxy.resolveSession(m, { 'x-session-id': 'fresh' });
+  proxy.resolveSession(m, { 'x-session-id': 'old' });
+  m.entries.get('old').createdAt -= 1000;
+  const removed = proxy.cleanupSessionMap(m);
+  assert.equal(removed, 1);
+  assert.ok(m.entries.has('fresh'));
+  assert.ok(!m.entries.has('old'));
+});

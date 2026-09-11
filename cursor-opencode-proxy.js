@@ -74,7 +74,7 @@ function loadConfig(file, env = process.env) {
   }
   if (typeof env.COP_AUTH_TOKEN === 'string' && env.COP_AUTH_TOKEN) cfg.auth.token = env.COP_AUTH_TOKEN;
   // 开鉴权却空令牌 = 以为受保护实则全开放,启动即拒绝
-  if (cfg.auth.enabled && !cfg.auth.token) {
+  if (cfg.auth.enabled && !cfg.auth.token.trim()) {
     throw new Error('config: auth.enabled is true but auth.token is empty (set auth.token in config.json or COP_AUTH_TOKEN env)');
   }
   if (parsed.tunnel && typeof parsed.tunnel === 'object') {
@@ -119,6 +119,7 @@ function filterHeaders(headers) {
 // 常量时间令牌比对:先 sha256 归一化为等长摘要,再 timingSafeEqual,避免长度与时序泄露
 function checkAuth(authCfg, headers) {
   if (!authCfg || !authCfg.enabled) return true;
+  if (typeof authCfg.token !== 'string' || !authCfg.token) return false;
   const key = String(authCfg.header || 'authorization').toLowerCase();
   const raw = headers[key];
   if (typeof raw !== 'string' || !raw) return false;

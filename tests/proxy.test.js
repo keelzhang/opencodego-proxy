@@ -530,3 +530,26 @@ test('checkAuth: 不同长度令牌拒绝且不抛异常(sha256 归一化路径)
   assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer a-much-longer-token-value' }), false);
   assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer x' }), false);
 });
+
+test('checkAuth: token 非字符串或缺失时短路拒绝(防 String(undefined) 绕过)', () => {
+  assert.equal(proxy.checkAuth({ enabled: true, header: 'authorization' }, { authorization: 'Bearer undefined' }), false);
+  assert.equal(proxy.checkAuth({ enabled: true, header: 'authorization', token: 123 }, { authorization: 'Bearer 123' }), false);
+  assert.equal(proxy.checkAuth({ enabled: true, header: 'authorization', token: '' }, { authorization: 'Bearer ' }), false);
+});
+
+test('loadConfig: auth.enabled=true 且 token 为纯空白串抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true, token: '   ' } }), {}),
+    /auth\.token/,
+  );
+});
+
+test('checkAuth: 未配置 header 时默认回落 authorization', () => {
+  assert.equal(proxy.checkAuth({ enabled: true, token: 'secret' }, { authorization: 'Bearer secret' }), true);
+});
+
+test('checkAuth: 头值前后空白被 trim 后仍可匹配', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { authorization: '  Bearer secret ' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer   secret' }), true);
+});

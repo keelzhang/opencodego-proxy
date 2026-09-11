@@ -772,7 +772,7 @@ test('startTunnel: 子进程异常退出后按 restartDelayMs 重启', async (t)
   // 真实子进程退出时触发 'exit' + 'close';ENOENT 时只触发 'error' + 'close'。
   // 管理器监听 'close' 以统一覆盖两种情况(探针实测)。
   fake.children[0].emit('close', 1, null);
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 200));
   assert.equal(fake.calls.length, 2, 'should relaunch after abnormal exit');
 });
 
@@ -786,7 +786,7 @@ test('startTunnel: stop() 终止子进程且不再重启', async (t) => {
   tun.stop();
   assert.equal(fake.children[0].killed, true);
   fake.children[0].emit('close', 0, null);
-  await new Promise((r) => setTimeout(r, 80));
+  await new Promise((r) => setTimeout(r, 200));
   assert.equal(fake.calls.length, 1, 'should not relaunch after stop');
 });
 
@@ -814,4 +814,42 @@ test('startTunnel: 二进制不存在(ENOENT)不无限重启,代理仍正常服�
   } finally {
     console.error = origErr;
   }
+});
+
+test('startTunnel: ENOENT 只 spawn 一次,不无限重启(断言 spawn 次数)', async (t) => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cop-missing', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const origErr = console.error;
+  console.error = () => {}; // 抑制预期的错误信息,避免污染测试输出
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  t.after(() => { tun.stop(); console.error = origErr; });
+  const child = fake.children[0];
+  // 模拟真实的 ENOENT 事件序:'error'(code=ENOENT) 后跟 'close'
+  child.emit('error', Object.assign(new Error('spawn cop-missing ENOENT'), { code: 'ENOENT' }));
+  child.emit('close', -2, null);
+  await new Promise((r) => setTimeout(r, 200)); // 远大于 restartDelayMs*2
+  console.error = origErr;
+  assert.equal(fake.calls.length, 1, 'ENOENT must not trigger relaunch');
+  assert.equal(tun.state.restarts, 0, 'restarts must stay 0 on ENOENT');
+});
+
+test('startTunnel: 致命 spawn 错误(EACCES)同样不无限重启', async (t) => {
+  const fake = makeFakeSpawn();
+  const errs = [];
+  const origErr = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cop-noexec', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  t.after(() => { tun.stop(); console.error = origErr; });
+  fake.children[0].emit('error', Object.assign(new Error('spawn cop-noexec EACCES'), { code: 'EACCES' }));
+  fake.children[0].emit('close', -2, null);
+  await new Promise((r) => setTimeout(r, 200));
+  console.error = origErr;
+  assert.equal(fake.calls.length, 1, 'EACCES must not trigger relaunch');
 });

@@ -141,7 +141,7 @@ function buildTunnelArgs(tunnelCfg) {
   return args;
 }
 
-// 隧道子进程管理:崩溃按延迟重启;二进制缺失(ENOENT)只报错不重启(重启无意义);
+// 隧道子进程管理:崩溃按延迟重启;不可恢复的 spawn 失败(ENOENT/EACCES/EPERM,重启无意义)只报错不重启;
 // 任何失败都不影响代理自身对外服务。
 // 监听 'close' 而非 'exit':实测——子进程正常退出触发 'exit'+'close',
 // 而 spawn 失败(ENOENT)只触发 'error'+'close'(无 'exit')。用 'close' 可统一覆盖两种情况,
@@ -165,8 +165,8 @@ function startTunnel(cfg, deps = {}) {
     }
     state.child = child;
     child.on('error', (e) => {
-      if (e && e.code === 'ENOENT') spawnFailed = true;
-      console.error(`[tunnel] cannot start "${tunnelCfg.binary}": ${e.message} -- install cloudflared or fix tunnel.binary; proxy keeps serving`);
+      if (e && ['ENOENT', 'EACCES', 'EPERM'].includes(e.code)) spawnFailed = true;
+      console.error(`[tunnel] cannot start "${tunnelCfg.binary}" (${e.code || 'error'}): ${e.message} -- check tunnel.binary / install cloudflared; proxy keeps serving`);
     });
     child.on('close', (code, signal) => {
       if (state.child === child) state.child = null;

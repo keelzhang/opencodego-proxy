@@ -413,3 +413,67 @@ test('客户端断连 → 中止上游请求', async (t) => {
   for (let i = 0; i < 50 && !upstreamAborted; i++) await new Promise((r) => setTimeout(r, 20));
   assert.equal(upstreamAborted, true, 'upstream request should be aborted after client disconnect');
 });
+
+// ---------- 公网隧道 + 鉴权:任务 1 配置加载器 ----------
+
+test('loadConfig: auth/tunnel 缺省时均为关闭状态(向后兼容)', () => {
+  const cfg = proxy.loadConfig(makeConfigFile(VALID), {});
+  assert.equal(cfg.auth.enabled, false);
+  assert.equal(cfg.auth.header, 'authorization');
+  assert.equal(cfg.auth.token, '');
+  assert.equal(cfg.tunnel.enabled, false);
+  assert.equal(cfg.tunnel.binary, 'cloudflared');
+  assert.equal(cfg.tunnel.name, 'cursor-proxy');
+  assert.equal(cfg.tunnel.configFile, '');
+  assert.equal(cfg.tunnel.restartDelayMs, 5000);
+  assert.equal(cfg.log.tunnel, false);
+});
+
+test('loadConfig: auth/tunnel 字段被解析', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({
+    ...VALID,
+    auth: { enabled: true, header: 'x-api-token', token: 'tok-123' },
+    tunnel: { enabled: true, binary: 'C:/cf/cloudflared.exe', name: 'my-tunnel', configFile: 'C:/cf/config.yml', restartDelayMs: 1000 },
+    log: { headers: false, body: false, tunnel: true },
+  }), {});
+  assert.equal(cfg.auth.enabled, true);
+  assert.equal(cfg.auth.header, 'x-api-token');
+  assert.equal(cfg.auth.token, 'tok-123');
+  assert.equal(cfg.tunnel.enabled, true);
+  assert.equal(cfg.tunnel.binary, 'C:/cf/cloudflared.exe');
+  assert.equal(cfg.tunnel.name, 'my-tunnel');
+  assert.equal(cfg.tunnel.configFile, 'C:/cf/config.yml');
+  assert.equal(cfg.tunnel.restartDelayMs, 1000);
+  assert.equal(cfg.log.tunnel, true);
+});
+
+test('loadConfig: auth.enabled=true 且 token 为空抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true } }), {}),
+    /auth\.token/,
+  );
+});
+
+test('loadConfig: COP_AUTH_TOKEN 覆盖 auth.token', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true, token: 'from-file' } }), { COP_AUTH_TOKEN: 'from-env' });
+  assert.equal(cfg.auth.token, 'from-env');
+});
+
+test('loadConfig: COP_AUTH_TOKEN 可使 enabled 通过校验(空文件令牌+环境变量)', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true } }), { COP_AUTH_TOKEN: 'env-token' });
+  assert.equal(cfg.auth.token, 'env-token');
+});
+
+test('loadConfig: 非法 auth.header(含空格)抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, auth: { header: 'bad header' } }), {}),
+    /auth\.header/,
+  );
+});
+
+test('loadConfig: tunnel.enabled=true 且 name 为空抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { enabled: true, name: ' ' } }), {}),
+    /tunnel\.name/,
+  );
+});

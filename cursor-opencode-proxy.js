@@ -27,8 +27,10 @@ function loadConfig(file, env = process.env) {
     port: 8787,
     baseUrl: '',
     apiKey: '',
+    auth: { enabled: false, header: 'authorization', token: '' },
+    tunnel: { enabled: false, binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 },
     session: { strategy: 'auto', header: 'x-opencode-session', staticId: '00000000-0000-4000-8000-000000000000', ttlMs: 7200000 },
-    log: { headers: true, body: false },
+    log: { headers: true, body: false, tunnel: false },
   };
   const missing = [];
   if (typeof parsed.baseUrl === 'string' && parsed.baseUrl) cfg.baseUrl = parsed.baseUrl.replace(/\/+$/, '');
@@ -60,9 +62,33 @@ function loadConfig(file, env = process.env) {
     if (STRATEGIES.includes(parsed.session.strategy)) cfg.session.strategy = parsed.session.strategy;
     else throw new Error(`config: invalid session.strategy: ${JSON.stringify(parsed.session.strategy)} (allowed: ${STRATEGIES.join(', ')})`);
   }
+  if (parsed.auth && typeof parsed.auth === 'object') {
+    if (typeof parsed.auth.enabled === 'boolean') cfg.auth.enabled = parsed.auth.enabled;
+    if (typeof parsed.auth.header === 'string' && parsed.auth.header) cfg.auth.header = parsed.auth.header;
+    if (!/^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(cfg.auth.header)) {
+      throw new Error(`config: invalid auth.header: ${JSON.stringify(cfg.auth.header)} (must be an HTTP field-name token)`);
+    }
+    if (typeof parsed.auth.token === 'string') cfg.auth.token = parsed.auth.token;
+  }
+  if (typeof env.COP_AUTH_TOKEN === 'string' && env.COP_AUTH_TOKEN) cfg.auth.token = env.COP_AUTH_TOKEN;
+  // 开鉴权却空令牌 = 以为受保护实则全开放,启动即拒绝
+  if (cfg.auth.enabled && !cfg.auth.token) {
+    throw new Error('config: auth.enabled is true but auth.token is empty (set auth.token in config.json or COP_AUTH_TOKEN env)');
+  }
+  if (parsed.tunnel && typeof parsed.tunnel === 'object') {
+    if (typeof parsed.tunnel.enabled === 'boolean') cfg.tunnel.enabled = parsed.tunnel.enabled;
+    if (typeof parsed.tunnel.binary === 'string' && parsed.tunnel.binary) cfg.tunnel.binary = parsed.tunnel.binary;
+    if (typeof parsed.tunnel.name === 'string') cfg.tunnel.name = parsed.tunnel.name;
+    if (typeof parsed.tunnel.configFile === 'string') cfg.tunnel.configFile = parsed.tunnel.configFile;
+    if (Number.isInteger(parsed.tunnel.restartDelayMs) && parsed.tunnel.restartDelayMs > 0) cfg.tunnel.restartDelayMs = parsed.tunnel.restartDelayMs;
+  }
+  if (cfg.tunnel.enabled && !cfg.tunnel.name.trim()) {
+    throw new Error(`config: invalid tunnel.name: ${JSON.stringify(cfg.tunnel.name)} (must be non-empty)`);
+  }
   if (parsed.log && typeof parsed.log === 'object') {
     if (typeof parsed.log.headers === 'boolean') cfg.log.headers = parsed.log.headers;
     if (typeof parsed.log.body === 'boolean') cfg.log.body = parsed.log.body;
+    if (typeof parsed.log.tunnel === 'boolean') cfg.log.tunnel = parsed.log.tunnel;
   }
   return cfg;
 }

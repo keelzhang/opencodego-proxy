@@ -413,3 +413,474 @@ test('客户端断连 → 中止上游请求', async (t) => {
   for (let i = 0; i < 50 && !upstreamAborted; i++) await new Promise((r) => setTimeout(r, 20));
   assert.equal(upstreamAborted, true, 'upstream request should be aborted after client disconnect');
 });
+
+// ---------- 公网隧道 + 鉴权:任务 1 配置加载器 ----------
+
+test('loadConfig: auth/tunnel 缺省时均为关闭状态(向后兼容)', () => {
+  const cfg = proxy.loadConfig(makeConfigFile(VALID), {});
+  assert.equal(cfg.auth.enabled, false);
+  assert.equal(cfg.auth.header, 'authorization');
+  assert.equal(cfg.auth.token, '');
+  assert.equal(cfg.tunnel.enabled, false);
+  assert.equal(cfg.tunnel.binary, 'cloudflared');
+  assert.equal(cfg.tunnel.name, 'cursor-proxy');
+  assert.equal(cfg.tunnel.configFile, '');
+  assert.equal(cfg.tunnel.restartDelayMs, 5000);
+  assert.equal(cfg.log.tunnel, false);
+});
+
+test('loadConfig: auth/tunnel 字段被解析', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({
+    ...VALID,
+    auth: { enabled: true, header: 'x-api-token', token: 'tok-123' },
+    tunnel: { enabled: true, binary: 'C:/cf/cloudflared.exe', name: 'my-tunnel', configFile: 'C:/cf/config.yml', restartDelayMs: 1000 },
+    log: { headers: false, body: false, tunnel: true },
+  }), {});
+  assert.equal(cfg.auth.enabled, true);
+  assert.equal(cfg.auth.header, 'x-api-token');
+  assert.equal(cfg.auth.token, 'tok-123');
+  assert.equal(cfg.tunnel.enabled, true);
+  assert.equal(cfg.tunnel.binary, 'C:/cf/cloudflared.exe');
+  assert.equal(cfg.tunnel.name, 'my-tunnel');
+  assert.equal(cfg.tunnel.configFile, 'C:/cf/config.yml');
+  assert.equal(cfg.tunnel.restartDelayMs, 1000);
+  assert.equal(cfg.log.tunnel, true);
+});
+
+test('loadConfig: auth.enabled=true 且 token 为空抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true } }), {}),
+    /auth\.token/,
+  );
+});
+
+test('loadConfig: COP_AUTH_TOKEN 覆盖 auth.token', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true, token: 'from-file' } }), { COP_AUTH_TOKEN: 'from-env' });
+  assert.equal(cfg.auth.token, 'from-env');
+});
+
+test('loadConfig: COP_AUTH_TOKEN 可使 enabled 通过校验(空文件令牌+环境变量)', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true } }), { COP_AUTH_TOKEN: 'env-token' });
+  assert.equal(cfg.auth.token, 'env-token');
+});
+
+test('loadConfig: 非法 auth.header(含空格)抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, auth: { header: 'bad header' } }), {}),
+    /auth\.header/,
+  );
+});
+
+test('loadConfig: tunnel.enabled=true 且 name 为空抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { enabled: true, name: ' ' } }), {}),
+    /tunnel\.name/,
+  );
+});
+
+test('loadConfig: tunnel.restartDelayMs 非正整数退回默认 5000', () => {
+  const zero = proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { restartDelayMs: 0 } }), {});
+  assert.equal(zero.tunnel.restartDelayMs, 5000);
+  const neg = proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { restartDelayMs: -1 } }), {});
+  assert.equal(neg.tunnel.restartDelayMs, 5000);
+});
+
+test('loadConfig: tunnel.binary 空串退回默认 cloudflared', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { binary: '' } }), {});
+  assert.equal(cfg.tunnel.binary, 'cloudflared');
+});
+
+test('loadConfig: auth.header 空串视为未设置,退回默认 authorization', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { header: '' } }), {});
+  assert.equal(cfg.auth.header, 'authorization');
+});
+
+test('loadConfig: auth.header 与 session.header 相同时抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({
+      ...VALID,
+      auth: { enabled: true, header: 'x-opencode-session', token: 'tok' },
+    }), {}),
+    /must differ/,
+  );
+});
+
+test('loadConfig: 即使鉴权关闭,session.header 也不能与 auth.header 相同', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({
+      ...VALID,
+      session: { ...VALID.session, header: 'authorization' },
+    }), {}),
+    /must differ/,
+  );
+});
+
+test('loadConfig: auth.header 与 session.header 仅大小写不同也视为冲突', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({
+      ...VALID,
+      session: { ...VALID.session, header: 'authorization' },
+      auth: { enabled: true, header: 'Authorization', token: 'tok' },
+    }), {}),
+    /must differ/,
+  );
+});
+
+// ---------- 任务 2:鉴权纯函数 ----------
+
+test('checkAuth: enabled=false 或配置缺失时一律通过', () => {
+  assert.equal(proxy.checkAuth({ enabled: false }, {}), true);
+  assert.equal(proxy.checkAuth(undefined, {}), true);
+  assert.equal(proxy.checkAuth({ enabled: false, header: 'authorization', token: 'x' }, {}), true);
+});
+
+test('checkAuth: 缺失/空/无 Bearer 前缀/令牌错误 均拒绝', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, {}), false);
+  assert.equal(proxy.checkAuth(cfg, { authorization: '' }), false);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'secret' }), false);   // 缺 Bearer 前缀
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer ' }), false);  // 前缀后为空
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer wrong' }), false);
+});
+
+test('checkAuth: 正确令牌通过,Bearer 前缀大小写不敏感', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer secret' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'bearer secret' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'BEARER secret' }), true);
+});
+
+test('checkAuth: 自定义 header 名生效,其他头不认', () => {
+  const cfg = { enabled: true, header: 'x-api-token', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { 'x-api-token': 'Bearer secret' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer secret' }), false);
+});
+
+test('checkAuth: 不同长度令牌拒绝且不抛异常(sha256 归一化路径)', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer a-much-longer-token-value' }), false);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer x' }), false);
+});
+
+test('checkAuth: token 非字符串或缺失时短路拒绝(防 String(undefined) 绕过)', () => {
+  assert.equal(proxy.checkAuth({ enabled: true, header: 'authorization' }, { authorization: 'Bearer undefined' }), false);
+  assert.equal(proxy.checkAuth({ enabled: true, header: 'authorization', token: 123 }, { authorization: 'Bearer 123' }), false);
+  assert.equal(proxy.checkAuth({ enabled: true, header: 'authorization', token: '' }, { authorization: 'Bearer ' }), false);
+});
+
+test('loadConfig: auth.enabled=true 且 token 为纯空白串抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({ ...VALID, auth: { enabled: true, token: '   ' } }), {}),
+    /auth\.token/,
+  );
+});
+
+test('checkAuth: 未配置 header 时默认回落 authorization', () => {
+  assert.equal(proxy.checkAuth({ enabled: true, token: 'secret' }, { authorization: 'Bearer secret' }), true);
+});
+
+test('checkAuth: 头值前后空白被 trim 后仍可匹配', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { authorization: '  Bearer secret ' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer   secret' }), true);
+});
+
+// ---------- 任务 3:鉴权端到端 ----------
+
+test('鉴权通过 → 请求透传上游,访问令牌被替换为上游 apiKey', async (t) => {
+  let seenAuth = null;
+  const up = await startFakeUpstream((rq, rs) => { seenAuth = rq.headers.authorization; rs.end('{"ok":true}'); });
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'up-key', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'access-token' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer access-token' } }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(seenAuth, 'Bearer up-key'); // 令牌与上游 key 隔离:替换为真正的上游 key
+});
+
+test('鉴权失败 → 401 且上游收到 0 个请求', async (t) => {
+  let upstreamHits = 0;
+  const up = await startFakeUpstream((rq, rs) => { upstreamHits++; rs.end('ok'); });
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer wrong' } }, '{}');
+  assert.equal(res.status, 401);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.error.code, 401);
+  assert.ok(String(res.headers['content-type']).includes('application/json'));
+  assert.equal(parsed.error.type, 'proxy_error');
+  assert.ok(parsed.error.message);
+  assert.equal(upstreamHits, 0);
+});
+
+test('鉴权失败 → 无 Authorization 头同样 401', async (t) => {
+  const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 401);
+});
+
+test('鉴权关闭时无令牌亦可透传(向后兼容)', async (t) => {
+  const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(res.body, 'ok');
+});
+
+test('鉴权失败时不回显收到的令牌', async (t) => {
+  const logs = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => logs.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+    const p = await startProxy({
+      baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+      log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+    });
+    t.after(() => closeSrv(p.srv));
+    t.after(() => closeSrv(up.srv));
+    await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer super-secret-guess' } }, '{}');
+  } finally {
+    console.warn = origWarn;
+  }
+  const all = logs.join('\n');
+  assert.ok(all.includes('401'));
+  assert.ok(!all.includes('super-secret-guess'));
+});
+
+// ---------- 审查必修轮:令牌隔离与鉴权短路回归 ----------
+
+test('鉴权失败在 body 缓冲之前返回 401(未读完 body 即响应)', { timeout: 5000 }, async (t) => {
+  const dead = await getDeadPort();
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+  });
+  t.after(() => closeSrv(p.srv));
+  await new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port: p.port, method: 'POST', path: '/v1/chat/completions',
+      headers: { authorization: 'Bearer wrong', 'content-length': '1000000' } }, (res) => {
+      try { assert.equal(res.statusCode, 401); } catch (e) { reject(e); return; }
+      res.resume();
+      res.on('end', () => { r.destroy(); resolve(); });
+    });
+    r.on('error', () => resolve());
+    r.write('x'.repeat(1000)); // 只写 1KB,远少于 content-length=1000000
+    // 故意不调用 r.end():若服务端等到 body 读完才响应,本测试会超时失败
+  });
+});
+
+test('自定义鉴权头时访问令牌不泄露给上游(令牌与上游 key 隔离)', async (t) => {
+  let seen = null;
+  const up = await startFakeUpstream((rq, rs) => { seen = { x: rq.headers['x-api-token'], a: rq.headers.authorization }; rs.end('ok'); });
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'up-key', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'x-api-token', token: 'access-token' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-api-token': 'Bearer access-token' } }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(seen.a, 'Bearer up-key');
+  assert.equal(seen.x, undefined); // 访问令牌不得转发给上游
+});
+
+test('自定义鉴权头时日志不泄露访问令牌', async (t) => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+    const p = await startProxy({
+      baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+      log: { headers: true, body: false }, auth: { enabled: true, header: 'x-api-token', token: 'access-token' },
+    });
+    t.after(() => closeSrv(p.srv));
+    t.after(() => closeSrv(up.srv));
+    await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-api-token': 'Bearer access-token' } }, '{}');
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(!logs.join('\n').includes('access-token'));
+});
+
+// ---------- 任务 4:隧道参数构造 ----------
+
+test('buildTunnelArgs: 指定 configFile 时含 --config', () => {
+  assert.deepEqual(
+    proxy.buildTunnelArgs({ binary: 'cloudflared', name: 'cursor-proxy', configFile: 'C:/cf/config.yml', restartDelayMs: 5000 }),
+    ['tunnel', '--config', 'C:/cf/config.yml', 'run', 'cursor-proxy'],
+  );
+});
+
+test('buildTunnelArgs: 未指定 configFile 时不含 --config', () => {
+  assert.deepEqual(
+    proxy.buildTunnelArgs({ binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 }),
+    ['tunnel', 'run', 'cursor-proxy'],
+  );
+});
+
+test('buildTunnelArgs: configFile 为纯空白串时不加 --config', () => {
+  assert.deepEqual(
+    proxy.buildTunnelArgs({ binary: 'cloudflared', name: 't', configFile: '   ', restartDelayMs: 5000 }),
+    ['tunnel', 'run', 't'],
+  );
+});
+
+// ---------- 任务 5:隧道管理器 ----------
+
+const { EventEmitter } = require('node:events');
+
+function makeFakeSpawn() {
+  const children = [];
+  const calls = [];
+  const spawn = (bin, args, opts) => {
+    calls.push({ bin, args, opts });
+    const c = new EventEmitter();
+    c.kill = () => { c.killed = true; };
+    children.push(c);
+    return c;
+  };
+  return { spawn, calls, children };
+}
+
+test('startTunnel: 按 buildTunnelArgs 拉起子进程', () => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  try {
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0].bin, 'cloudflared');
+    assert.deepEqual(fake.calls[0].args, ['tunnel', 'run', 'cursor-proxy']);
+    assert.equal(fake.calls[0].opts.stdio, 'ignore'); // log.tunnel=false 时静音
+  } finally {
+    tun.stop();
+  }
+});
+
+test('startTunnel: log.tunnel=true 时透传子进程输出(stdio=inherit)', () => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: true },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 't', configFile: 'C:/cf/config.yml', restartDelayMs: 5000 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  try {
+    assert.equal(fake.calls[0].opts.stdio, 'inherit');
+    assert.deepEqual(fake.calls[0].args, ['tunnel', '--config', 'C:/cf/config.yml', 'run', 't']);
+  } finally {
+    tun.stop();
+  }
+});
+
+test('startTunnel: 子进程异常退出后按 restartDelayMs 重启', async (t) => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  t.after(() => tun.stop());
+  assert.equal(fake.calls.length, 1);
+  // 真实子进程退出时触发 'exit' + 'close';ENOENT 时只触发 'error' + 'close'。
+  // 管理器监听 'close' 以统一覆盖两种情况(探针实测)。
+  fake.children[0].emit('close', 1, null);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fake.calls.length, 2, 'should relaunch after abnormal exit');
+});
+
+test('startTunnel: stop() 终止子进程且不再重启', async (t) => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  tun.stop();
+  assert.equal(fake.children[0].killed, true);
+  fake.children[0].emit('close', 0, null);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(fake.calls.length, 1, 'should not relaunch after stop');
+});
+
+test('startTunnel: 二进制不存在(ENOENT)不无限重启,代理仍正常服务', async (t) => {
+  const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+  t.after(() => closeSrv(up.srv));
+  const cfg = {
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false, tunnel: false },
+    tunnel: { enabled: true, binary: 'cop-nonexistent-binary-xyz', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const errs = [];
+  const origErr = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  const tun = proxy.startTunnel(cfg, {});
+  t.after(() => tun.stop());
+  try {
+    const p = await startProxy(cfg);
+    t.after(() => closeSrv(p.srv));
+    const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+    assert.equal(res.status, 200);   // 隧道挂掉不影响代理
+    assert.equal(res.body, 'ok');
+    await new Promise((r) => setTimeout(r, 120)); // 等 spawn 的 ENOENT 暴露
+    assert.ok(errs.join('\n').includes('cop-nonexistent-binary-xyz'), 'should report the missing binary');
+  } finally {
+    console.error = origErr;
+  }
+});
+
+test('startTunnel: ENOENT 只 spawn 一次,不无限重启(断言 spawn 次数)', async (t) => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cop-missing', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const origErr = console.error;
+  console.error = () => {}; // 抑制预期的错误信息,避免污染测试输出
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  t.after(() => { tun.stop(); console.error = origErr; });
+  const child = fake.children[0];
+  // 模拟真实的 ENOENT 事件序:'error'(code=ENOENT) 后跟 'close'
+  child.emit('error', Object.assign(new Error('spawn cop-missing ENOENT'), { code: 'ENOENT' }));
+  child.emit('close', -2, null);
+  await new Promise((r) => setTimeout(r, 200)); // 远大于 restartDelayMs*2
+  console.error = origErr;
+  assert.equal(fake.calls.length, 1, 'ENOENT must not trigger relaunch');
+  assert.equal(tun.state.restarts, 0, 'restarts must stay 0 on ENOENT');
+});
+
+test('startTunnel: 致命 spawn 错误(EACCES)同样不无限重启', async (t) => {
+  const fake = makeFakeSpawn();
+  const errs = [];
+  const origErr = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cop-noexec', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  t.after(() => { tun.stop(); console.error = origErr; });
+  fake.children[0].emit('error', Object.assign(new Error('spawn cop-noexec EACCES'), { code: 'EACCES' }));
+  fake.children[0].emit('close', -2, null);
+  await new Promise((r) => setTimeout(r, 200));
+  console.error = origErr;
+  assert.equal(fake.calls.length, 1, 'EACCES must not trigger relaunch');
+});

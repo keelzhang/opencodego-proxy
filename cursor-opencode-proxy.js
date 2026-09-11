@@ -3,11 +3,14 @@ const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const childProcess = require('node:child_process');
+const crypto = require('node:crypto');
+const { randomUUID } = crypto;
 
 const STRATEGIES = ['auto', 'per-request', 'static'];
 const PROBE_HEADERS = ['x-session-id', 'x-client-session-id', 'x-request-id'];
 const HOP_BY_HOP = ['host', 'connection', 'keep-alive', 'expect', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']; // expect: Node 上游请求不会自动发 100 Continue,透传会令上游挂起
+const HEADER_TOKEN_RE = /^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/; // RFC 7230 field-name token
 
 function loadConfig(file, env = process.env) {
   let raw;
@@ -27,8 +30,10 @@ function loadConfig(file, env = process.env) {
     port: 8787,
     baseUrl: '',
     apiKey: '',
+    auth: { enabled: false, header: 'authorization', token: '' },
+    tunnel: { enabled: false, binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 },
     session: { strategy: 'auto', header: 'x-opencode-session', staticId: '00000000-0000-4000-8000-000000000000', ttlMs: 7200000 },
-    log: { headers: true, body: false },
+    log: { headers: true, body: false, tunnel: false },
   };
   const missing = [];
   if (typeof parsed.baseUrl === 'string' && parsed.baseUrl) cfg.baseUrl = parsed.baseUrl.replace(/\/+$/, '');
@@ -49,7 +54,7 @@ function loadConfig(file, env = process.env) {
   if (!baseUrlValid) throw new Error(`config: invalid baseUrl: ${JSON.stringify(cfg.baseUrl)} (must be an absolute http/https URL)`);
   if (parsed.session && typeof parsed.session === 'object') {
     if (typeof parsed.session.header === 'string' && parsed.session.header) cfg.session.header = parsed.session.header;
-    if (!/^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(cfg.session.header)) {
+    if (!HEADER_TOKEN_RE.test(cfg.session.header)) {
       throw new Error(`config: invalid session.header: ${JSON.stringify(cfg.session.header)} (must be an HTTP field-name token)`);
     }
     if (typeof parsed.session.staticId === 'string' && parsed.session.staticId) cfg.session.staticId = parsed.session.staticId;
@@ -60,9 +65,38 @@ function loadConfig(file, env = process.env) {
     if (STRATEGIES.includes(parsed.session.strategy)) cfg.session.strategy = parsed.session.strategy;
     else throw new Error(`config: invalid session.strategy: ${JSON.stringify(parsed.session.strategy)} (allowed: ${STRATEGIES.join(', ')})`);
   }
+  if (parsed.auth && typeof parsed.auth === 'object') {
+    if (typeof parsed.auth.enabled === 'boolean') cfg.auth.enabled = parsed.auth.enabled;
+    if (typeof parsed.auth.header === 'string' && parsed.auth.header) cfg.auth.header = parsed.auth.header;
+    if (!HEADER_TOKEN_RE.test(cfg.auth.header)) {
+      throw new Error(`config: invalid auth.header: ${JSON.stringify(cfg.auth.header)} (must be an HTTP field-name token)`);
+    }
+    if (typeof parsed.auth.token === 'string') cfg.auth.token = parsed.auth.token;
+  }
+  if (typeof env.COP_AUTH_TOKEN === 'string' && env.COP_AUTH_TOKEN) cfg.auth.token = env.COP_AUTH_TOKEN;
+  // 开鉴权却空令牌 = 以为受保护实则全开放,启动即拒绝
+  if (cfg.auth.enabled && !cfg.auth.token.trim()) {
+    throw new Error('config: auth.enabled is true but auth.token is empty (set auth.token in config.json or COP_AUTH_TOKEN env)');
+  }
+  // session.header 不能与 auth.header 同名:proxyRequest 会无条件写入 headers['authorization']=上游 apiKey,
+  // 若随后 headers[session.header]=sessionId 与之同名则覆盖上游鉴权头,导致上游 401。无论鉴权是否开启都必须拦截。
+  if (cfg.session.header.toLowerCase() === cfg.auth.header.toLowerCase()) {
+    throw new Error(`config: auth.header and session.header must differ, both are ${JSON.stringify(cfg.auth.header)}`);
+  }
+  if (parsed.tunnel && typeof parsed.tunnel === 'object') {
+    if (typeof parsed.tunnel.enabled === 'boolean') cfg.tunnel.enabled = parsed.tunnel.enabled;
+    if (typeof parsed.tunnel.binary === 'string' && parsed.tunnel.binary) cfg.tunnel.binary = parsed.tunnel.binary;
+    if (typeof parsed.tunnel.name === 'string') cfg.tunnel.name = parsed.tunnel.name;
+    if (typeof parsed.tunnel.configFile === 'string') cfg.tunnel.configFile = parsed.tunnel.configFile;
+    if (Number.isInteger(parsed.tunnel.restartDelayMs) && parsed.tunnel.restartDelayMs > 0) cfg.tunnel.restartDelayMs = parsed.tunnel.restartDelayMs;
+  }
+  if (cfg.tunnel.enabled && !cfg.tunnel.name.trim()) {
+    throw new Error(`config: invalid tunnel.name: ${JSON.stringify(cfg.tunnel.name)} (must be non-empty)`);
+  }
   if (parsed.log && typeof parsed.log === 'object') {
     if (typeof parsed.log.headers === 'boolean') cfg.log.headers = parsed.log.headers;
     if (typeof parsed.log.body === 'boolean') cfg.log.body = parsed.log.body;
+    if (typeof parsed.log.tunnel === 'boolean') cfg.log.tunnel = parsed.log.tunnel;
   }
   return cfg;
 }
@@ -86,6 +120,79 @@ function filterHeaders(headers) {
     if (!HOP_BY_HOP.includes(k.toLowerCase())) out[k.toLowerCase()] = v;
   }
   return out;
+}
+
+// 常量时间令牌比对:先 sha256 归一化为等长摘要,再 timingSafeEqual,避免长度与时序泄露
+function checkAuth(authCfg, headers) {
+  if (!authCfg || !authCfg.enabled) return true;
+  if (typeof authCfg.token !== 'string' || !authCfg.token) return false;
+  const key = String(authCfg.header || 'authorization').toLowerCase();
+  const raw = headers[key];
+  if (typeof raw !== 'string' || !raw) return false;
+  const m = /^Bearer\s+(.+)$/i.exec(raw.trim());
+  if (!m) return false;
+  const given = m[1].trim();
+  if (!given) return false;
+  const a = crypto.createHash('sha256').update(given, 'utf8').digest();
+  const b = crypto.createHash('sha256').update(String(authCfg.token), 'utf8').digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// cloudflared 参数拼装:独立成纯函数便于单测
+function buildTunnelArgs(tunnelCfg) {
+  const args = ['tunnel'];
+  if (tunnelCfg.configFile && String(tunnelCfg.configFile).trim()) args.push('--config', tunnelCfg.configFile);
+  args.push('run', tunnelCfg.name);
+  return args;
+}
+
+// 隧道子进程管理:崩溃按延迟重启;不可恢复的 spawn 失败(ENOENT/EACCES/EPERM,重启无意义)只报错不重启;
+// 任何失败都不影响代理自身对外服务。
+// 监听 'close' 而非 'exit':实测——子进程正常退出触发 'exit'+'close',
+// 而 spawn 失败(ENOENT)只触发 'error'+'close'(无 'exit')。用 'close' 可统一覆盖两种情况,
+// 并保证 state.child 在任何路径下都被清理。
+function startTunnel(cfg, deps = {}) {
+  const spawn = deps.spawn || childProcess.spawn;
+  const tunnelCfg = cfg.tunnel;
+  const state = { child: null, stopped: false, restarts: 0, timer: null };
+
+  function launch() {
+    if (state.stopped) return;
+    let child;
+    let spawnFailed = false;
+    try {
+      child = spawn(tunnelCfg.binary, buildTunnelArgs(tunnelCfg), {
+        stdio: cfg.log && cfg.log.tunnel ? 'inherit' : 'ignore',
+      });
+    } catch (e) {
+      console.error(`[tunnel] failed to spawn "${tunnelCfg.binary}": ${e.message} -- proxy keeps serving without tunnel`);
+      return;
+    }
+    state.child = child;
+    child.on('error', (e) => {
+      if (e && ['ENOENT', 'EACCES', 'EPERM'].includes(e.code)) spawnFailed = true;
+      console.error(`[tunnel] cannot start "${tunnelCfg.binary}" (${e.code || 'error'}): ${e.message} -- check tunnel.binary / install cloudflared; proxy keeps serving`);
+    });
+    child.on('close', (code, signal) => {
+      if (state.child === child) state.child = null;
+      if (state.stopped || spawnFailed) return;
+      state.restarts += 1;
+      console.warn(`[tunnel] cloudflared exited (code=${code} signal=${signal}); restart #${state.restarts} in ${tunnelCfg.restartDelayMs}ms`);
+      state.timer = setTimeout(launch, tunnelCfg.restartDelayMs);
+      if (state.timer.unref) state.timer.unref();
+    });
+  }
+
+  function stop() {
+    state.stopped = true;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    const c = state.child;
+    state.child = null;
+    if (c) { try { c.kill(); } catch { /* 已退出 */ } }
+  }
+
+  launch();
+  return { stop, state };
 }
 
 function createSessionManager(sessionCfg) {
@@ -116,10 +223,12 @@ const MAX_BODY = 10 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 60000;
 const SESSION_HINT_STATUS = new Set([400, 401, 403]); // 上游 session routing 拒绝的典型状态码(规格 5.4)
 
-function redactHeaders(headers) {
+function redactHeaders(headers, authHeader) {
   const out = {};
+  const secret = String(authHeader || 'authorization').toLowerCase();
   for (const [k, v] of Object.entries(headers)) {
-    out[k] = /^authorization$/i.test(k) ? 'Bearer ***' : v; // 日志不回显 apiKey
+    const isSecret = /^authorization$/i.test(k) || k.toLowerCase() === secret;
+    out[k] = isSecret ? 'Bearer ***' : v; // 日志不回显访问令牌/apiKey
   }
   return out;
 }
@@ -129,7 +238,7 @@ function logRequest(cfg, req, sessionId) {
     .map((h) => (req.headers[h] ? `${h}=${String(req.headers[h]).slice(0, 12)}…` : null))
     .filter(Boolean);
   console.log(`${new Date().toISOString()} ${req.method} ${req.url} [${probed.join(' ') || 'no-session-header'}] -> ${cfg.session.header}=${sessionId}`);
-  if (cfg.log.headers) console.log('  headers:', JSON.stringify(redactHeaders(req.headers)));
+  if (cfg.log.headers) console.log('  headers:', JSON.stringify(redactHeaders(req.headers, cfg.auth?.header)));
 }
 
 function sendOpenAIError(res, status, message) {
@@ -145,6 +254,13 @@ function createHotReloader(cfg) {
 
 function proxyRequest(req, res, hot) {
   const cfg = hot.config;
+  // 鉴权在 body 缓冲之前:未通过不读取 body、不转发上游
+  if (!checkAuth(cfg.auth, req.headers)) {
+    console.warn(`${new Date().toISOString()} ${req.method} ${req.url} 401 unauthorized (missing or invalid access token)`);
+    sendOpenAIError(res, 401, 'unauthorized: missing or invalid access token');
+    req.resume(); // 排空请求体,避免客户端仍在上传时连接悬挂
+    return;
+  }
   const chunks = [];
   let size = 0;
   let rejected = false;
@@ -171,6 +287,8 @@ function proxyRequest(req, res, hot) {
       const headers = filterHeaders(req.headers);
       delete headers['content-length']; // Node 按实际转发字节自动设置
       delete headers['host'];           // Node 按 baseUrl 自动设置上游 host
+      // 客户端访问令牌仅用于本地鉴权:先剔除客户端鉴权头(其恰为 authorization 时也被下面覆盖),再写入上游 apiKey,确保访问令牌不外流上游
+      delete headers[String(cfg.auth?.header || 'authorization').toLowerCase()];
       headers['authorization'] = `Bearer ${cfg.apiKey}`;
       headers[cfg.session.header] = sessionId;
       const mod = cfg.baseUrl.startsWith('https:') ? https : http;
@@ -270,11 +388,32 @@ function main() {
   srv.listen(cfg.port, '127.0.0.1', () => {
     console.log(`cursor-opencode-proxy listening on http://127.0.0.1:${cfg.port} (Cursor Base URL: http://127.0.0.1:${cfg.port}/v1)`);
     console.log(`upstream: ${cfg.baseUrl} | session: ${cfg.session.strategy} via header "${cfg.session.header}"`);
+    console.log(cfg.auth.enabled
+      ? `auth: enabled via header "${cfg.auth.header}"`
+      : 'auth: disabled (anyone who can reach this port can use your upstream key)');
   });
   srv.on('error', (e) => {
     console.error(`listen failed: ${e.message} (change port in config.json or COP_PORT env)`);
     process.exit(1);
   });
+
+  let tunnel = null;
+  if (cfg.tunnel.enabled) {
+    tunnel = startTunnel(cfg, {});
+    console.log(`[tunnel] starting: ${cfg.tunnel.binary} ${buildTunnelArgs(cfg.tunnel).join(' ')}`);
+  } else {
+    console.log('[tunnel] disabled (set tunnel.enabled=true to auto-start cloudflared)');
+  }
+
+  const shutdown = () => {
+    if (tunnel) tunnel.stop();
+    srv.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref(); // 兜底:关闭超时也退出
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.on('exit', () => { if (tunnel) tunnel.stop(); }); // 同步清理,避免遗留孤儿 cloudflared
+
   watchConfig(configFile, () => {
     const r = applyHotConfig(hot, configFile);
     if (r.ok) console.log(`[hot-reload] applied: baseUrl=${r.config.baseUrl} session=${r.config.session.strategy} (port change requires restart)`);
@@ -290,4 +429,5 @@ if (require.main === module) main();
 module.exports = {
   loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession,
   createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
+  checkAuth, buildTunnelArgs, startTunnel,
 };

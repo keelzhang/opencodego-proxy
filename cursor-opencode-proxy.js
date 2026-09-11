@@ -78,6 +78,10 @@ function loadConfig(file, env = process.env) {
   if (cfg.auth.enabled && !cfg.auth.token.trim()) {
     throw new Error('config: auth.enabled is true but auth.token is empty (set auth.token in config.json or COP_AUTH_TOKEN env)');
   }
+  // auth.header 与 session.header 同名字段会互相覆盖(proxyRequest 中 headers[session.header]=sessionId 覆盖鉴权头,或反之),启动即拒绝
+  if (cfg.auth.enabled && cfg.session.header.toLowerCase() === cfg.auth.header.toLowerCase()) {
+    throw new Error(`config: auth.header and session.header must differ, both are ${JSON.stringify(cfg.auth.header)}`);
+  }
   if (parsed.tunnel && typeof parsed.tunnel === 'object') {
     if (typeof parsed.tunnel.enabled === 'boolean') cfg.tunnel.enabled = parsed.tunnel.enabled;
     if (typeof parsed.tunnel.binary === 'string' && parsed.tunnel.binary) cfg.tunnel.binary = parsed.tunnel.binary;
@@ -383,11 +387,32 @@ function main() {
   srv.listen(cfg.port, '127.0.0.1', () => {
     console.log(`cursor-opencode-proxy listening on http://127.0.0.1:${cfg.port} (Cursor Base URL: http://127.0.0.1:${cfg.port}/v1)`);
     console.log(`upstream: ${cfg.baseUrl} | session: ${cfg.session.strategy} via header "${cfg.session.header}"`);
+    console.log(cfg.auth.enabled
+      ? `auth: enabled via header "${cfg.auth.header}"`
+      : 'auth: disabled (anyone who can reach this port can use your upstream key)');
   });
   srv.on('error', (e) => {
     console.error(`listen failed: ${e.message} (change port in config.json or COP_PORT env)`);
     process.exit(1);
   });
+
+  let tunnel = null;
+  if (cfg.tunnel.enabled) {
+    tunnel = startTunnel(cfg, {});
+    console.log(`[tunnel] starting: ${cfg.tunnel.binary} ${buildTunnelArgs(cfg.tunnel).join(' ')}`);
+  } else {
+    console.log('[tunnel] disabled (set tunnel.enabled=true to auto-start cloudflared)');
+  }
+
+  const shutdown = () => {
+    if (tunnel) tunnel.stop();
+    srv.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 1000).unref(); // 兜底:关闭超时也退出
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.on('exit', () => { if (tunnel) tunnel.stop(); }); // 同步清理,避免遗留孤儿 cloudflared
+
   watchConfig(configFile, () => {
     const r = applyHotConfig(hot, configFile);
     if (r.ok) console.log(`[hot-reload] applied: baseUrl=${r.config.baseUrl} session=${r.config.session.strategy} (port change requires restart)`);

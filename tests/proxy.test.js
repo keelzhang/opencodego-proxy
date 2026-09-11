@@ -495,6 +495,24 @@ test('loadConfig: auth.header 空串视为未设置,退回默认 authorization',
   assert.equal(cfg.auth.header, 'authorization');
 });
 
+test('loadConfig: auth.header 与 session.header 相同时抛出错误', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({
+      ...VALID,
+      auth: { enabled: true, header: 'x-opencode-session', token: 'tok' },
+    }), {}),
+    /must differ/,
+  );
+});
+
+test('loadConfig: 鉴权关闭时 auth.header 与 session.header 相同不报错', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({
+    ...VALID,
+    auth: { enabled: false, header: 'x-opencode-session', token: '' },
+  }), {});
+  assert.equal(cfg.auth.enabled, false);
+});
+
 // ---------- 任务 2:鉴权纯函数 ----------
 
 test('checkAuth: enabled=false 或配置缺失时一律通过', () => {

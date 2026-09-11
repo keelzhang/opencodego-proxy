@@ -3,6 +3,7 @@ const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
+const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 const { randomUUID } = crypto;
 
@@ -135,9 +136,58 @@ function checkAuth(authCfg, headers) {
 // cloudflared 参数拼装:独立成纯函数便于单测
 function buildTunnelArgs(tunnelCfg) {
   const args = ['tunnel'];
-  if (tunnelCfg.configFile) args.push('--config', tunnelCfg.configFile);
+  if (tunnelCfg.configFile && String(tunnelCfg.configFile).trim()) args.push('--config', tunnelCfg.configFile);
   args.push('run', tunnelCfg.name);
   return args;
+}
+
+// 隧道子进程管理:崩溃按延迟重启;二进制缺失(ENOENT)只报错不重启(重启无意义);
+// 任何失败都不影响代理自身对外服务。
+// 监听 'close' 而非 'exit':实测——子进程正常退出触发 'exit'+'close',
+// 而 spawn 失败(ENOENT)只触发 'error'+'close'(无 'exit')。用 'close' 可统一覆盖两种情况,
+// 并保证 state.child 在任何路径下都被清理。
+function startTunnel(cfg, deps = {}) {
+  const spawn = deps.spawn || childProcess.spawn;
+  const tunnelCfg = cfg.tunnel;
+  const state = { child: null, stopped: false, restarts: 0, timer: null };
+
+  function launch() {
+    if (state.stopped) return;
+    let child;
+    let spawnFailed = false;
+    try {
+      child = spawn(tunnelCfg.binary, buildTunnelArgs(tunnelCfg), {
+        stdio: cfg.log && cfg.log.tunnel ? 'inherit' : 'ignore',
+      });
+    } catch (e) {
+      console.error(`[tunnel] failed to spawn "${tunnelCfg.binary}": ${e.message} -- proxy keeps serving without tunnel`);
+      return;
+    }
+    state.child = child;
+    child.on('error', (e) => {
+      if (e && e.code === 'ENOENT') spawnFailed = true;
+      console.error(`[tunnel] cannot start "${tunnelCfg.binary}": ${e.message} -- install cloudflared or fix tunnel.binary; proxy keeps serving`);
+    });
+    child.on('close', (code, signal) => {
+      if (state.child === child) state.child = null;
+      if (state.stopped || spawnFailed) return;
+      state.restarts += 1;
+      console.warn(`[tunnel] cloudflared exited (code=${code} signal=${signal}); restart #${state.restarts} in ${tunnelCfg.restartDelayMs}ms`);
+      state.timer = setTimeout(launch, tunnelCfg.restartDelayMs);
+      if (state.timer.unref) state.timer.unref();
+    });
+  }
+
+  function stop() {
+    state.stopped = true;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    const c = state.child;
+    state.child = null;
+    if (c) { try { c.kill(); } catch { /* 已退出 */ } }
+  }
+
+  launch();
+  return { stop, state };
 }
 
 function createSessionManager(sessionCfg) {
@@ -353,5 +403,5 @@ if (require.main === module) main();
 module.exports = {
   loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession,
   createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
-  checkAuth, buildTunnelArgs,
+  checkAuth, buildTunnelArgs, startTunnel,
 };

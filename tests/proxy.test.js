@@ -703,3 +703,115 @@ test('buildTunnelArgs: 未指定 configFile 时不含 --config', () => {
     ['tunnel', 'run', 'cursor-proxy'],
   );
 });
+
+test('buildTunnelArgs: configFile 为纯空白串时不加 --config', () => {
+  assert.deepEqual(
+    proxy.buildTunnelArgs({ binary: 'cloudflared', name: 't', configFile: '   ', restartDelayMs: 5000 }),
+    ['tunnel', 'run', 't'],
+  );
+});
+
+// ---------- 任务 5:隧道管理器 ----------
+
+const { EventEmitter } = require('node:events');
+
+function makeFakeSpawn() {
+  const children = [];
+  const calls = [];
+  const spawn = (bin, args, opts) => {
+    calls.push({ bin, args, opts });
+    const c = new EventEmitter();
+    c.kill = () => { c.killed = true; };
+    children.push(c);
+    return c;
+  };
+  return { spawn, calls, children };
+}
+
+test('startTunnel: 按 buildTunnelArgs 拉起子进程', () => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  try {
+    assert.equal(fake.calls.length, 1);
+    assert.equal(fake.calls[0].bin, 'cloudflared');
+    assert.deepEqual(fake.calls[0].args, ['tunnel', 'run', 'cursor-proxy']);
+    assert.equal(fake.calls[0].opts.stdio, 'ignore'); // log.tunnel=false 时静音
+  } finally {
+    tun.stop();
+  }
+});
+
+test('startTunnel: log.tunnel=true 时透传子进程输出(stdio=inherit)', () => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: true },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 't', configFile: 'C:/cf/config.yml', restartDelayMs: 5000 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  try {
+    assert.equal(fake.calls[0].opts.stdio, 'inherit');
+    assert.deepEqual(fake.calls[0].args, ['tunnel', '--config', 'C:/cf/config.yml', 'run', 't']);
+  } finally {
+    tun.stop();
+  }
+});
+
+test('startTunnel: 子进程异常退出后按 restartDelayMs 重启', async (t) => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  t.after(() => tun.stop());
+  assert.equal(fake.calls.length, 1);
+  // 真实子进程退出时触发 'exit' + 'close';ENOENT 时只触发 'error' + 'close'。
+  // 管理器监听 'close' 以统一覆盖两种情况(探针实测)。
+  fake.children[0].emit('close', 1, null);
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(fake.calls.length, 2, 'should relaunch after abnormal exit');
+});
+
+test('startTunnel: stop() 终止子进程且不再重启', async (t) => {
+  const fake = makeFakeSpawn();
+  const cfg = {
+    log: { tunnel: false },
+    tunnel: { enabled: true, binary: 'cloudflared', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const tun = proxy.startTunnel(cfg, { spawn: fake.spawn });
+  tun.stop();
+  assert.equal(fake.children[0].killed, true);
+  fake.children[0].emit('close', 0, null);
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(fake.calls.length, 1, 'should not relaunch after stop');
+});
+
+test('startTunnel: 二进制不存在(ENOENT)不无限重启,代理仍正常服务', async (t) => {
+  const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+  t.after(() => closeSrv(up.srv));
+  const cfg = {
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false, tunnel: false },
+    tunnel: { enabled: true, binary: 'cop-nonexistent-binary-xyz', name: 't', configFile: '', restartDelayMs: 20 },
+  };
+  const errs = [];
+  const origErr = console.error;
+  console.error = (...a) => errs.push(a.join(' '));
+  const tun = proxy.startTunnel(cfg, {});
+  t.after(() => tun.stop());
+  try {
+    const p = await startProxy(cfg);
+    t.after(() => closeSrv(p.srv));
+    const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+    assert.equal(res.status, 200);   // 隧道挂掉不影响代理
+    assert.equal(res.body, 'ok');
+    await new Promise((r) => setTimeout(r, 120)); // 等 spawn 的 ENOENT 暴露
+    assert.ok(errs.join('\n').includes('cop-nonexistent-binary-xyz'), 'should report the missing binary');
+  } finally {
+    console.error = origErr;
+  }
+});

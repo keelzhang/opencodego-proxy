@@ -553,3 +553,79 @@ test('checkAuth: 头值前后空白被 trim 后仍可匹配', () => {
   assert.equal(proxy.checkAuth(cfg, { authorization: '  Bearer secret ' }), true);
   assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer   secret' }), true);
 });
+
+// ---------- 任务 3:鉴权端到端 ----------
+
+test('鉴权通过 → 请求透传上游,访问令牌被替换为上游 apiKey', async (t) => {
+  let seenAuth = null;
+  const up = await startFakeUpstream((rq, rs) => { seenAuth = rq.headers.authorization; rs.end('{"ok":true}'); });
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'up-key', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'access-token' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer access-token' } }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(seenAuth, 'Bearer up-key'); // 令牌与上游 key 隔离:替换为真正的上游 key
+});
+
+test('鉴权失败 → 401 且上游收到 0 个请求', async (t) => {
+  let upstreamHits = 0;
+  const up = await startFakeUpstream((rq, rs) => { upstreamHits++; rs.end('ok'); });
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer wrong' } }, '{}');
+  assert.equal(res.status, 401);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.error.type, 'proxy_error');
+  assert.ok(parsed.error.message);
+  assert.equal(upstreamHits, 0);
+});
+
+test('鉴权失败 → 无 Authorization 头同样 401', async (t) => {
+  const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 401);
+});
+
+test('鉴权关闭时无令牌亦可透传(向后兼容)', async (t) => {
+  const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+  const p = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false } });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: {} }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(res.body, 'ok');
+});
+
+test('鉴权失败时不回显收到的令牌', async (t) => {
+  const logs = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => logs.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+    const p = await startProxy({
+      baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+      log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+    });
+    t.after(() => closeSrv(p.srv));
+    t.after(() => closeSrv(up.srv));
+    await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer super-secret-guess' } }, '{}');
+  } finally {
+    console.warn = origWarn;
+  }
+  const all = logs.join('\n');
+  assert.ok(all.includes('401'));
+  assert.ok(!all.includes('super-secret-guess'));
+});

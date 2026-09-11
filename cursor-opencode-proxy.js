@@ -189,6 +189,13 @@ function createHotReloader(cfg) {
 
 function proxyRequest(req, res, hot) {
   const cfg = hot.config;
+  // 鉴权在 body 缓冲之前:未通过不读取 body、不转发上游
+  if (!checkAuth(cfg.auth, req.headers)) {
+    console.warn(`${new Date().toISOString()} ${req.method} ${req.url} 401 unauthorized (missing or invalid access token)`);
+    sendOpenAIError(res, 401, 'unauthorized: missing or invalid access token');
+    req.resume(); // 排空请求体,避免客户端仍在上传时连接悬挂
+    return;
+  }
   const chunks = [];
   let size = 0;
   let rejected = false;

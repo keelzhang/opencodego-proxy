@@ -78,8 +78,8 @@ ingress:
 | log.tunnel | false | 透传 cloudflared 子进程输出(stdio inherit) |
 
 - 环境变量 `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` 可覆盖对应字段,热重载后依然生效
-- `auth.header` 与 `session.header` 不能相同(同名会互相覆盖),否则启动即拒绝
-- 修改 `config.json` 保存即热重载;非法配置保留旧配置并告警;端口变更需重启
+- `auth.header` 与 `session.header` 不能相同(同名会覆盖上游 Authorization 头导致上游 401),无论鉴权是否开启都会在启动时拒绝
+- 修改 `config.json` 保存即热重载;非法配置保留旧配置并告警;端口变更与 `tunnel.*` 变更需重启进程
 - 首次启动若无 `config.json`,自动从模板复制后退出
 
 ## 测试

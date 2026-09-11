@@ -78,8 +78,9 @@ function loadConfig(file, env = process.env) {
   if (cfg.auth.enabled && !cfg.auth.token.trim()) {
     throw new Error('config: auth.enabled is true but auth.token is empty (set auth.token in config.json or COP_AUTH_TOKEN env)');
   }
-  // auth.header 与 session.header 同名字段会互相覆盖(proxyRequest 中 headers[session.header]=sessionId 覆盖鉴权头,或反之),启动即拒绝
-  if (cfg.auth.enabled && cfg.session.header.toLowerCase() === cfg.auth.header.toLowerCase()) {
+  // session.header 不能与 auth.header 同名:proxyRequest 会无条件写入 headers['authorization']=上游 apiKey,
+  // 若随后 headers[session.header]=sessionId 与之同名则覆盖上游鉴权头,导致上游 401。无论鉴权是否开启都必须拦截。
+  if (cfg.session.header.toLowerCase() === cfg.auth.header.toLowerCase()) {
     throw new Error(`config: auth.header and session.header must differ, both are ${JSON.stringify(cfg.auth.header)}`);
   }
   if (parsed.tunnel && typeof parsed.tunnel === 'object') {

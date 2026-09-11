@@ -505,12 +505,25 @@ test('loadConfig: auth.header 与 session.header 相同时抛出错误', () => {
   );
 });
 
-test('loadConfig: 鉴权关闭时 auth.header 与 session.header 相同不报错', () => {
-  const cfg = proxy.loadConfig(makeConfigFile({
-    ...VALID,
-    auth: { enabled: false, header: 'x-opencode-session', token: '' },
-  }), {});
-  assert.equal(cfg.auth.enabled, false);
+test('loadConfig: 即使鉴权关闭,session.header 也不能与 auth.header 相同', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({
+      ...VALID,
+      session: { ...VALID.session, header: 'authorization' },
+    }), {}),
+    /must differ/,
+  );
+});
+
+test('loadConfig: auth.header 与 session.header 仅大小写不同也视为冲突', () => {
+  assert.throws(
+    () => proxy.loadConfig(makeConfigFile({
+      ...VALID,
+      session: { ...VALID.session, header: 'authorization' },
+      auth: { enabled: true, header: 'Authorization', token: 'tok' },
+    }), {}),
+    /must differ/,
+  );
 });
 
 // ---------- 任务 2:鉴权纯函数 ----------

@@ -82,6 +82,13 @@ ingress:
 - 修改 `config.json` 保存即热重载;非法配置保留旧配置并告警;端口变更与 `tunnel.*` 变更需重启进程
 - 首次启动若无 `config.json`,自动从模板复制后退出
 
+## 升级注意
+
+本版本新增鉴权与隧道能力,有两处可能影响旧配置:
+
+1. **`auth.header` 与 `session.header` 不能同名。** 若旧配置把两者配成同一个字段(例如都为 `x-opencode-session`),升级后启动会被拒绝并报 `config: auth.header and session.header must differ`。原因是 `proxyRequest` 会无条件写入 `headers['authorization'] = Bearer <上游 apiKey>`,随后 `headers[session.header] = <sessionId>` 若与之同名会覆盖上游鉴权头,导致上游 401。请把 `session.header` 改回 `x-opencode-session`(默认值)或另选一个不冲突的名字。
+2. **Cursor 的 Base URL 不能再填 `http://127.0.0.1:8787/v1`。** 该做法经查实不可用:Cursor 的 BYOK 请求由 Cursor 服务端代发,其 SSRF 防护会拒绝私有网段并返回 `403 Access to private networks is forbidden`。须改用 cloudflared 命名隧道暴露的公网 HTTPS 地址,见「公网接入」。
+
 ## 测试
 
 ```

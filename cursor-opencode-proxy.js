@@ -3,7 +3,8 @@ const http = require('node:http');
 const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const crypto = require('node:crypto');
+const { randomUUID } = crypto;
 
 const STRATEGIES = ['auto', 'per-request', 'static'];
 const PROBE_HEADERS = ['x-session-id', 'x-client-session-id', 'x-request-id'];
@@ -113,6 +114,21 @@ function filterHeaders(headers) {
     if (!HOP_BY_HOP.includes(k.toLowerCase())) out[k.toLowerCase()] = v;
   }
   return out;
+}
+
+// 常量时间令牌比对:先 sha256 归一化为等长摘要,再 timingSafeEqual,避免长度与时序泄露
+function checkAuth(authCfg, headers) {
+  if (!authCfg || !authCfg.enabled) return true;
+  const key = String(authCfg.header || 'authorization').toLowerCase();
+  const raw = headers[key];
+  if (typeof raw !== 'string' || !raw) return false;
+  const m = /^Bearer\s+(.+)$/i.exec(raw.trim());
+  if (!m) return false;
+  const given = m[1].trim();
+  if (!given) return false;
+  const a = crypto.createHash('sha256').update(given, 'utf8').digest();
+  const b = crypto.createHash('sha256').update(String(authCfg.token), 'utf8').digest();
+  return crypto.timingSafeEqual(a, b);
 }
 
 function createSessionManager(sessionCfg) {
@@ -317,4 +333,5 @@ if (require.main === module) main();
 module.exports = {
   loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession,
   createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
+  checkAuth,
 };

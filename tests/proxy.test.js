@@ -494,3 +494,39 @@ test('loadConfig: auth.header 空串视为未设置,退回默认 authorization',
   const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { header: '' } }), {});
   assert.equal(cfg.auth.header, 'authorization');
 });
+
+// ---------- 任务 2:鉴权纯函数 ----------
+
+test('checkAuth: enabled=false 或配置缺失时一律通过', () => {
+  assert.equal(proxy.checkAuth({ enabled: false }, {}), true);
+  assert.equal(proxy.checkAuth(undefined, {}), true);
+  assert.equal(proxy.checkAuth({ enabled: false, header: 'authorization', token: 'x' }, {}), true);
+});
+
+test('checkAuth: 缺失/空/无 Bearer 前缀/令牌错误 均拒绝', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, {}), false);
+  assert.equal(proxy.checkAuth(cfg, { authorization: '' }), false);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'secret' }), false);   // 缺 Bearer 前缀
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer ' }), false);  // 前缀后为空
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer wrong' }), false);
+});
+
+test('checkAuth: 正确令牌通过,Bearer 前缀大小写不敏感', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer secret' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'bearer secret' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'BEARER secret' }), true);
+});
+
+test('checkAuth: 自定义 header 名生效,其他头不认', () => {
+  const cfg = { enabled: true, header: 'x-api-token', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { 'x-api-token': 'Bearer secret' }), true);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer secret' }), false);
+});
+
+test('checkAuth: 不同长度令牌拒绝且不抛异常(sha256 归一化路径)', () => {
+  const cfg = { enabled: true, header: 'authorization', token: 'secret' };
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer a-much-longer-token-value' }), false);
+  assert.equal(proxy.checkAuth(cfg, { authorization: 'Bearer x' }), false);
+});

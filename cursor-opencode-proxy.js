@@ -8,6 +8,7 @@ const { randomUUID } = require('node:crypto');
 const STRATEGIES = ['auto', 'per-request', 'static'];
 const PROBE_HEADERS = ['x-session-id', 'x-client-session-id', 'x-request-id'];
 const HOP_BY_HOP = ['host', 'connection', 'keep-alive', 'expect', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']; // expect: Node 上游请求不会自动发 100 Continue,透传会令上游挂起
+const HEADER_TOKEN_RE = /^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/; // RFC 7230 field-name token
 
 function loadConfig(file, env = process.env) {
   let raw;
@@ -51,7 +52,7 @@ function loadConfig(file, env = process.env) {
   if (!baseUrlValid) throw new Error(`config: invalid baseUrl: ${JSON.stringify(cfg.baseUrl)} (must be an absolute http/https URL)`);
   if (parsed.session && typeof parsed.session === 'object') {
     if (typeof parsed.session.header === 'string' && parsed.session.header) cfg.session.header = parsed.session.header;
-    if (!/^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(cfg.session.header)) {
+    if (!HEADER_TOKEN_RE.test(cfg.session.header)) {
       throw new Error(`config: invalid session.header: ${JSON.stringify(cfg.session.header)} (must be an HTTP field-name token)`);
     }
     if (typeof parsed.session.staticId === 'string' && parsed.session.staticId) cfg.session.staticId = parsed.session.staticId;
@@ -65,7 +66,7 @@ function loadConfig(file, env = process.env) {
   if (parsed.auth && typeof parsed.auth === 'object') {
     if (typeof parsed.auth.enabled === 'boolean') cfg.auth.enabled = parsed.auth.enabled;
     if (typeof parsed.auth.header === 'string' && parsed.auth.header) cfg.auth.header = parsed.auth.header;
-    if (!/^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/.test(cfg.auth.header)) {
+    if (!HEADER_TOKEN_RE.test(cfg.auth.header)) {
       throw new Error(`config: invalid auth.header: ${JSON.stringify(cfg.auth.header)} (must be an HTTP field-name token)`);
     }
     if (typeof parsed.auth.token === 'string') cfg.auth.token = parsed.auth.token;

@@ -477,3 +477,20 @@ test('loadConfig: tunnel.enabled=true 且 name 为空抛出错误', () => {
     /tunnel\.name/,
   );
 });
+
+test('loadConfig: tunnel.restartDelayMs 非正整数退回默认 5000', () => {
+  const zero = proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { restartDelayMs: 0 } }), {});
+  assert.equal(zero.tunnel.restartDelayMs, 5000);
+  const neg = proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { restartDelayMs: -1 } }), {});
+  assert.equal(neg.tunnel.restartDelayMs, 5000);
+});
+
+test('loadConfig: tunnel.binary 空串退回默认 cloudflared', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, tunnel: { binary: '' } }), {});
+  assert.equal(cfg.tunnel.binary, 'cloudflared');
+});
+
+test('loadConfig: auth.header 空串视为未设置,退回默认 authorization', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ ...VALID, auth: { header: '' } }), {});
+  assert.equal(cfg.auth.header, 'authorization');
+});

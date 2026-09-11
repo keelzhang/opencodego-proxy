@@ -2,11 +2,23 @@
   "port": 8787,
   "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
   "apiKey": "your-api-key",
+  "auth": {
+    "enabled": false,
+    "header": "authorization",
+    "token": ""
+  },
+  "tunnel": {
+    "enabled": false,
+    "binary": "cloudflared",
+    "name": "cursor-proxy",
+    "configFile": "",
+    "restartDelayMs": 5000
+  },
   "session": {
     "strategy": "auto",
     "header": "x-opencode-session",
     "staticId": "00000000-0000-4000-8000-000000000000",
     "ttlMs": 7200000
   },
-  "log": { "headers": true, "body": false }
+  "log": { "headers": true, "body": false, "tunnel": false }
 }

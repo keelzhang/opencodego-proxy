@@ -582,6 +582,8 @@ test('鉴权失败 → 401 且上游收到 0 个请求', async (t) => {
   const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { authorization: 'Bearer wrong' } }, '{}');
   assert.equal(res.status, 401);
   const parsed = JSON.parse(res.body);
+  assert.equal(parsed.error.code, 401);
+  assert.ok(String(res.headers['content-type']).includes('application/json'));
   assert.equal(parsed.error.type, 'proxy_error');
   assert.ok(parsed.error.message);
   assert.equal(upstreamHits, 0);
@@ -628,4 +630,60 @@ test('鉴权失败时不回显收到的令牌', async (t) => {
   const all = logs.join('\n');
   assert.ok(all.includes('401'));
   assert.ok(!all.includes('super-secret-guess'));
+});
+
+// ---------- 审查必修轮:令牌隔离与鉴权短路回归 ----------
+
+test('鉴权失败在 body 缓冲之前返回 401(未读完 body 即响应)', async (t) => {
+  const dead = await getDeadPort();
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'authorization', token: 'secret' },
+  });
+  t.after(() => closeSrv(p.srv));
+  await new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port: p.port, method: 'POST', path: '/v1/chat/completions',
+      headers: { authorization: 'Bearer wrong', 'content-length': '1000000' } }, (res) => {
+      try { assert.equal(res.statusCode, 401); } catch (e) { reject(e); return; }
+      res.resume();
+      res.on('end', () => { r.destroy(); resolve(); });
+    });
+    r.on('error', () => resolve());
+    r.write('x'.repeat(1000)); // 只写 1KB,远少于 content-length=1000000
+    // 故意不调用 r.end():若服务端等到 body 读完才响应,本测试会超时失败
+  });
+});
+
+test('自定义鉴权头时访问令牌不泄露给上游(令牌与上游 key 隔离)', async (t) => {
+  let seen = null;
+  const up = await startFakeUpstream((rq, rs) => { seen = { x: rq.headers['x-api-token'], a: rq.headers.authorization }; rs.end('ok'); });
+  const p = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'up-key', session: VALID.session,
+    log: { headers: false, body: false }, auth: { enabled: true, header: 'x-api-token', token: 'access-token' },
+  });
+  t.after(() => closeSrv(p.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-api-token': 'Bearer access-token' } }, '{}');
+  assert.equal(res.status, 200);
+  assert.equal(seen.a, 'Bearer up-key');
+  assert.equal(seen.x, undefined); // 访问令牌不得转发给上游
+});
+
+test('自定义鉴权头时日志不泄露访问令牌', async (t) => {
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => logs.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => rs.end('ok'));
+    const p = await startProxy({
+      baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session,
+      log: { headers: true, body: false }, auth: { enabled: true, header: 'x-api-token', token: 'access-token' },
+    });
+    t.after(() => closeSrv(p.srv));
+    t.after(() => closeSrv(up.srv));
+    await req(p.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'x-api-token': 'Bearer access-token' } }, '{}');
+  } finally {
+    console.log = orig;
+  }
+  assert.ok(!logs.join('\n').includes('access-token'));
 });

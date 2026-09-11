@@ -160,10 +160,12 @@ const MAX_BODY = 10 * 1024 * 1024;
 const UPSTREAM_TIMEOUT_MS = 60000;
 const SESSION_HINT_STATUS = new Set([400, 401, 403]); // 上游 session routing 拒绝的典型状态码(规格 5.4)
 
-function redactHeaders(headers) {
+function redactHeaders(headers, authHeader) {
   const out = {};
+  const secret = String(authHeader || 'authorization').toLowerCase();
   for (const [k, v] of Object.entries(headers)) {
-    out[k] = /^authorization$/i.test(k) ? 'Bearer ***' : v; // 日志不回显 apiKey
+    const isSecret = /^authorization$/i.test(k) || k.toLowerCase() === secret;
+    out[k] = isSecret ? 'Bearer ***' : v; // 日志不回显访问令牌/apiKey
   }
   return out;
 }
@@ -173,7 +175,7 @@ function logRequest(cfg, req, sessionId) {
     .map((h) => (req.headers[h] ? `${h}=${String(req.headers[h]).slice(0, 12)}…` : null))
     .filter(Boolean);
   console.log(`${new Date().toISOString()} ${req.method} ${req.url} [${probed.join(' ') || 'no-session-header'}] -> ${cfg.session.header}=${sessionId}`);
-  if (cfg.log.headers) console.log('  headers:', JSON.stringify(redactHeaders(req.headers)));
+  if (cfg.log.headers) console.log('  headers:', JSON.stringify(redactHeaders(req.headers, cfg.auth?.header)));
 }
 
 function sendOpenAIError(res, status, message) {
@@ -222,6 +224,8 @@ function proxyRequest(req, res, hot) {
       const headers = filterHeaders(req.headers);
       delete headers['content-length']; // Node 按实际转发字节自动设置
       delete headers['host'];           // Node 按 baseUrl 自动设置上游 host
+      // 客户端访问令牌仅用于本地鉴权:先剔除客户端鉴权头(其恰为 authorization 时也被下面覆盖),再写入上游 apiKey,确保访问令牌不外流上游
+      delete headers[String(cfg.auth?.header || 'authorization').toLowerCase()];
       headers['authorization'] = `Bearer ${cfg.apiKey}`;
       headers[cfg.session.header] = sessionId;
       const mod = cfg.baseUrl.startsWith('https:') ? https : http;

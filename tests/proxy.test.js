@@ -634,7 +634,7 @@ test('鉴权失败时不回显收到的令牌', async (t) => {
 
 // ---------- 审查必修轮:令牌隔离与鉴权短路回归 ----------
 
-test('鉴权失败在 body 缓冲之前返回 401(未读完 body 即响应)', async (t) => {
+test('鉴权失败在 body 缓冲之前返回 401(未读完 body 即响应)', { timeout: 5000 }, async (t) => {
   const dead = await getDeadPort();
   const p = await startProxy({
     baseUrl: `http://127.0.0.1:${dead}`, apiKey: 'k', session: VALID.session,
@@ -686,4 +686,20 @@ test('自定义鉴权头时日志不泄露访问令牌', async (t) => {
     console.log = orig;
   }
   assert.ok(!logs.join('\n').includes('access-token'));
+});
+
+// ---------- 任务 4:隧道参数构造 ----------
+
+test('buildTunnelArgs: 指定 configFile 时含 --config', () => {
+  assert.deepEqual(
+    proxy.buildTunnelArgs({ binary: 'cloudflared', name: 'cursor-proxy', configFile: 'C:/cf/config.yml', restartDelayMs: 5000 }),
+    ['tunnel', '--config', 'C:/cf/config.yml', 'run', 'cursor-proxy'],
+  );
+});
+
+test('buildTunnelArgs: 未指定 configFile 时不含 --config', () => {
+  assert.deepEqual(
+    proxy.buildTunnelArgs({ binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 }),
+    ['tunnel', 'run', 'cursor-proxy'],
+  );
 });

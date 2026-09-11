@@ -132,6 +132,14 @@ function checkAuth(authCfg, headers) {
   return crypto.timingSafeEqual(a, b);
 }
 
+// cloudflared 参数拼装:独立成纯函数便于单测
+function buildTunnelArgs(tunnelCfg) {
+  const args = ['tunnel'];
+  if (tunnelCfg.configFile) args.push('--config', tunnelCfg.configFile);
+  args.push('run', tunnelCfg.name);
+  return args;
+}
+
 function createSessionManager(sessionCfg) {
   return { cfg: sessionCfg, entries: new Map() };
 }
@@ -345,5 +353,5 @@ if (require.main === module) main();
 module.exports = {
   loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession,
   createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
-  checkAuth,
+  checkAuth, buildTunnelArgs,
 };

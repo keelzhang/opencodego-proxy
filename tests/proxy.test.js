@@ -125,6 +125,25 @@ test('resolveSession: TTL 过期后同 key 生成新 UUID', () => {
   assert.notEqual(v1, v2);
 });
 
+test('resolveSession: 无任何会话头时设备级兜底头 cf-warp-tag-id 复用同一 UUID(过渡方案)', () => {
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'x-opencode-session', staticId: 'sid', ttlMs: 7200000 });
+  const a = proxy.resolveSession(m, { 'cf-warp-tag-id': 'dc07968e-c0a8-4601-b979-f98646c67158' });
+  const b = proxy.resolveSession(m, { 'cf-warp-tag-id': 'dc07968e-c0a8-4601-b979-f98646c67158' });
+  assert.equal(a, b);
+});
+
+test('resolveSession: 存在会话头时设备级兜底头不参与(不把不同对话并入同一 session)', () => {
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'x-opencode-session', staticId: 'sid', ttlMs: 7200000 });
+  const a = proxy.resolveSession(m, { 'x-session-id': 'A', 'cf-warp-tag-id': 'T' });
+  const b = proxy.resolveSession(m, { 'x-session-id': 'B', 'cf-warp-tag-id': 'T' });
+  assert.notEqual(a, b);
+});
+
+test('resolveSession: 无任何可探测头时 auto 仍降级为每请求新 UUID', () => {
+  const m = proxy.createSessionManager({ strategy: 'auto', header: 'x-opencode-session', staticId: 'sid', ttlMs: 7200000 });
+  assert.notEqual(proxy.resolveSession(m, { host: 'proxy.example.com' }), proxy.resolveSession(m, { host: 'proxy.example.com' }));
+});
+
 test('filterHeaders: host 头被过滤(由 Node 按上游自动生成)', () => {
   const out = proxy.filterHeaders({ Host: 'localhost:8787', 'content-type': 'application/json' });
   assert.deepEqual(out, { 'content-type': 'application/json' });
@@ -717,6 +736,153 @@ test('自定义鉴权头时日志不泄露访问令牌', async (t) => {
     console.log = orig;
   }
   assert.ok(!logs.join('\n').includes('access-token'));
+});
+
+// ---------- 从 cloudflared config.yml 推导 Cursor 的公网 Base URL ----------
+
+test('parseTunnelHostnames: 解析 ingress 的 hostname/service,catch-all 项被忽略', () => {
+  const entries = proxy.parseTunnelHostnames([
+    'tunnel: b0477f95-b418-431d-91df-cd8c863629fa',
+    'credentials-file: C:\\Users\\u\\.cloudflared\\b0477f95.json',
+    '',
+    'ingress:',
+    '  - hostname: proxy.example.com',
+    '    service: http://127.0.0.1:8787',
+    '  - service: http_status:404',
+  ].join('\n'));
+  assert.deepEqual(entries, [{ hostname: 'proxy.example.com', service: 'http://127.0.0.1:8787' }]);
+});
+
+test('parseTunnelHostnames: 引号与行内注释被剥离', () => {
+  const entries = proxy.parseTunnelHostnames([
+    'ingress:',
+    "  - hostname: 'proxy.example.com'   # 主入口",
+    '    service: http://127.0.0.1:8787 # 本地代理',
+    '  - hostname: "alt.example.com"',
+    '    service: http://127.0.0.1:9999',
+  ].join('\n'));
+  assert.deepEqual(entries, [
+    { hostname: 'proxy.example.com', service: 'http://127.0.0.1:8787' },
+    { hostname: 'alt.example.com', service: 'http://127.0.0.1:9999' },
+  ]);
+});
+
+test('parseTunnelHostnames: ingress 块返回顶层后不再摄取(缩进判定)', () => {
+  const entries = proxy.parseTunnelHostnames([
+    'ingress:',
+    '  - hostname: proxy.example.com',
+    '    service: http://127.0.0.1:8787',
+    'warp-routing:',
+    '  enabled: true',
+    'originRequest:',
+    '  connectTimeout: 30',
+  ].join('\n'));
+  assert.deepEqual(entries, [{ hostname: 'proxy.example.com', service: 'http://127.0.0.1:8787' }]);
+});
+
+test('parseTunnelHostnames: 注释行与空行被跳过', () => {
+  const entries = proxy.parseTunnelHostnames([
+    '# 说明',
+    'ingress:',
+    '',
+    '  # 入口',
+    '  - hostname: proxy.example.com',
+    '    service: http://127.0.0.1:8787',
+  ].join('\n'));
+  assert.deepEqual(entries, [{ hostname: 'proxy.example.com', service: 'http://127.0.0.1:8787' }]);
+});
+
+test('parseTunnelHostnames: 无 ingress / 无 hostname 时返回空数组', () => {
+  assert.deepEqual(proxy.parseTunnelHostnames('tunnel: x\n'), []);
+  assert.deepEqual(proxy.parseTunnelHostnames('ingress:\n  - service: http_status:404\n'), []);
+  assert.deepEqual(proxy.parseTunnelHostnames(''), []);
+});
+
+test('pickPublicHost: 优先选 service 端口与本代理 port 一致的那条', () => {
+  const entries = [
+    { hostname: 'other.example.com', service: 'http://127.0.0.1:9999' },
+    { hostname: 'proxy.example.com', service: 'http://127.0.0.1:8787' },
+  ];
+  assert.equal(proxy.pickPublicHost(entries, 8787), 'proxy.example.com');
+});
+
+test('pickPublicHost: 无端口匹配时回退首个 hostname;空列表返回 null', () => {
+  const entries = [
+    { hostname: 'first.example.com', service: 'http://127.0.0.1:9999' },
+    { hostname: 'second.example.com', service: 'http://127.0.0.1:8888' },
+  ];
+  assert.equal(proxy.pickPublicHost(entries, 8787), 'first.example.com');
+  assert.equal(proxy.pickPublicHost([], 8787), null);
+});
+
+test('derivePublicBaseUrl: 从 config.yml 推导 https://host/v1', () => {
+  const r = proxy.derivePublicBaseUrl({ configFile: 'C:/cf/config.yml' }, 8787,
+    () => 'ingress:\n  - hostname: proxy.example.com\n    service: http://127.0.0.1:8787\n  - service: http_status:404\n');
+  assert.equal(r.url, 'https://proxy.example.com/v1');
+  assert.equal(r.hostname, 'proxy.example.com');
+  assert.equal(r.error, null);
+});
+
+test('derivePublicBaseUrl: 未配置 configFile 时返回 error 而非抛异常', () => {
+  const r = proxy.derivePublicBaseUrl({ configFile: '  ' }, 8787, () => { throw new Error('should not read'); });
+  assert.equal(r.url, null);
+  assert.ok(r.error);
+});
+
+test('derivePublicBaseUrl: 读文件失败返回 error 而非抛异常(启动不中断)', () => {
+  const r = proxy.derivePublicBaseUrl({ configFile: 'C:/nope.yml' }, 8787,
+    () => { const e = new Error('ENOENT: no such file'); e.code = 'ENOENT'; throw e; });
+  assert.equal(r.url, null);
+  assert.ok(r.error.includes('ENOENT'));
+});
+
+test('derivePublicBaseUrl: config.yml 无 hostname 时返回 error', () => {
+  const r = proxy.derivePublicBaseUrl({ configFile: 'C:/cf/config.yml' }, 8787,
+    () => 'ingress:\n  - service: http_status:404\n');
+  assert.equal(r.url, null);
+  assert.ok(r.error);
+});
+
+test('formatCursorSetup: 打印公网 Base URL 与访问令牌(便于直接照抄到 Cursor)', () => {
+  const lines = proxy.formatCursorSetup(
+    { auth: { enabled: true, header: 'authorization', token: 'cop-abc123' }, tunnel: { configFile: 'C:/cf/config.yml' } },
+    { url: 'https://proxy.example.com/v1', hostname: 'proxy.example.com', error: null },
+  );
+  assert.equal(lines.length, 2);
+  assert.ok(lines[0].includes('https://proxy.example.com/v1'));
+  assert.ok(lines[0].includes('proxy.example.com'));
+  assert.ok(lines[1].includes('cop-abc123'));
+  assert.ok(lines[1].includes('not the upstream apiKey')); // 明确区分,避免把上游 key 误填进 Cursor
+});
+
+test('formatCursorSetup: 只打印访问令牌,绝不回显上游 apiKey', () => {
+  const lines = proxy.formatCursorSetup(
+    { apiKey: 'sk-UPSTREAM-SECRET', auth: { enabled: true, header: 'authorization', token: 'cop-abc123' }, tunnel: { configFile: 'C:/cf/config.yml' } },
+    { url: 'https://proxy.example.com/v1', hostname: 'proxy.example.com', error: null },
+  );
+  assert.ok(!lines.join('\n').includes('sk-UPSTREAM-SECRET'));
+});
+
+test('formatCursorSetup: 鉴权关闭时提示填任意值,不提示空令牌', () => {
+  const lines = proxy.formatCursorSetup(
+    { auth: { enabled: false, header: 'authorization', token: '' }, tunnel: { configFile: 'C:/cf/config.yml' } },
+    { url: 'https://proxy.example.com/v1', hostname: 'proxy.example.com', error: null },
+  );
+  assert.equal(lines.length, 2);
+  assert.ok(lines[1].includes('auth disabled'));
+  assert.ok(/any/i.test(lines[1]));
+});
+
+test('formatCursorSetup: 地址推导失败时给出 unknown 与指引,令牌行照常打印', () => {
+  const lines = proxy.formatCursorSetup(
+    { auth: { enabled: true, header: 'authorization', token: 'cop-abc123' }, tunnel: { configFile: 'C:/nope.yml' } },
+    { url: null, hostname: null, error: 'cannot read C:/nope.yml: ENOENT' },
+  );
+  assert.equal(lines.length, 2);
+  assert.ok(lines[0].includes('unknown'));
+  assert.ok(lines[0].includes('ENOENT'));
+  assert.ok(lines[0].includes('README'));
+  assert.ok(lines[1].includes('cop-abc123')); // 地址推导失败不影响令牌提示
 });
 
 // ---------- 任务 4:隧道参数构造 ----------

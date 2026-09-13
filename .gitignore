@@ -10,3 +10,6 @@ __pycache__/
 
 # 隔离工作树(子代理实现)
 .worktrees/
+
+# Reasonix 运行时状态
+.reasonix/

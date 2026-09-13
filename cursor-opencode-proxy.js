@@ -9,6 +9,11 @@ const { randomUUID } = crypto;
 
 const STRATEGIES = ['auto', 'per-request', 'static'];
 const PROBE_HEADERS = ['x-session-id', 'x-client-session-id', 'x-request-id'];
+// 设备级兜底头:仅当上面一个会话头都没出现时才参与。
+// 起因:Cursor 官方确认(forum.cursor.com topic 166994, CursorStaff 回复)发往自定义 OpenAI 兼容 base URL 的请求
+// 不带任何 conversation/agent 身份头,故 auto 策略原本每次请求都新 UUID。
+// cf-warp-tag-id 由 Cloudflare 注入,是跨请求稳定的设备标识(同一设备的所有对话会共用同一 session,属过渡妥协)。
+const DEVICE_PROBE_HEADERS = ['cf-warp-tag-id'];
 const HOP_BY_HOP = ['host', 'connection', 'keep-alive', 'expect', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']; // expect: Node 上游请求不会自动发 100 Continue,透传会令上游挂起
 const HEADER_TOKEN_RE = /^[-!#$%&'*+.^_`|~0-9A-Za-z]+$/; // RFC 7230 field-name token
 
@@ -146,6 +151,92 @@ function buildTunnelArgs(tunnelCfg) {
   return args;
 }
 
+// ---- 从 cloudflared config.yml 推导 Cursor 应填的公网 Base URL ----
+// 起因:Cursor 不能填 127.0.0.1(其服务端代发 BYOK 请求,SSRF 防护拒绝私有网段),
+// 而代理只监听 127.0.0.1,唯一的公网地址就是隧道 ingress 的 hostname,故直接从中读取,免得再抄一遍。
+// 只做够用的手写扫描(零依赖):识别 block style 的 ingress 列表项,取 hostname 与 service。
+// 不支持 flow style(`- {hostname: x}`)、锚点/别名与多行标量——cloudflared tunnel create 生成的是 block style。
+
+// 去掉 YAML 标量的包裹引号与行内注释;不抛异常(解析失败只影响一句启动提示)
+function stripYamlScalar(raw) {
+  let v = String(raw == null ? '' : raw).trim();
+  if (!v) return '';
+  const q = v[0];
+  if (q === '"' || q === "'") {
+    const end = v.indexOf(q, 1);
+    return end > 0 ? v.slice(1, end) : v.slice(1); // 未闭合引号:尽力而为
+  }
+  const hash = v.indexOf('#'); // YAML 要求 # 前有空白才算注释,这里放宽为见到即截断
+  if (hash >= 0) v = v.slice(0, hash);
+  return v.trim();
+}
+
+// 返回 [{ hostname, service }]:只保留带 hostname 的项(ingress 末尾的 catch-all 天然被过滤掉)
+function parseTunnelHostnames(yamlText) {
+  const entries = [];
+  let inIngress = false;
+  let ingressIndent = 0;
+  let current = null;
+  for (const rawLine of String(yamlText == null ? '' : yamlText).split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const indent = rawLine.length - rawLine.trimStart().length;
+    if (!inIngress) {
+      if (indent === 0 && /^ingress\s*:/.test(trimmed)) { inIngress = true; ingressIndent = indent; }
+      continue;
+    }
+    if (indent <= ingressIndent) break; // 缩进回到顶层,ingress 块结束
+    const isItem = trimmed === '-' || trimmed.startsWith('- ');
+    const kv = /^-?\s*([A-Za-z0-9_.-]+)\s*:\s*(.*)$/.exec(trimmed);
+    if (isItem) { current = {}; entries.push(current); }
+    if (!kv || !current) continue; // 结构意外的行:跳过而非猜测归属
+    if (kv[1] === 'hostname') current.hostname = stripYamlScalar(kv[2]);
+    else if (kv[1] === 'service') current.service = stripYamlScalar(kv[2]);
+  }
+  return entries.filter((e) => e.hostname);
+}
+
+// 多条 ingress 时优先选 service 指向本代理端口的那个 hostname,否则回退首个
+function pickPublicHost(entries, port) {
+  if (!Array.isArray(entries) || !entries.length) return null;
+  const re = new RegExp(`:${port}/?$`);
+  const match = entries.find((e) => typeof e.service === 'string' && re.test(e.service.trim()));
+  return (match || entries[0]).hostname || null;
+}
+
+// 启动日志用。任何失败都返回 error 而不抛:推导不出来只影响提示文案,不该拦下代理启动。
+function derivePublicBaseUrl(tunnelCfg, port, readFileFn) {
+  const read = readFileFn || ((p) => fs.readFileSync(p, 'utf8'));
+  const cf = tunnelCfg && tunnelCfg.configFile ? String(tunnelCfg.configFile).trim() : '';
+  if (!cf) return { url: null, hostname: null, error: 'tunnel.configFile not set' };
+  let text;
+  try {
+    text = read(cf);
+  } catch (e) {
+    return { url: null, hostname: null, error: `cannot read ${cf}: ${e.message}` };
+  }
+  const hostname = pickPublicHost(parseTunnelHostnames(text), port);
+  if (!hostname) return { url: null, hostname: null, error: `no ingress hostname found in ${cf}` };
+  return { url: `https://${hostname}/v1`, hostname, error: null };
+}
+
+// Cursor 接入所需的启动提示(纯函数,便于单测):公网 Base URL + 该填的访问令牌。
+// 刻意只打印 auth.token(Cursor 连本代理用的那把),绝不打印 cfg.apiKey(本代理连上游用的那把)——
+// 后者不该出现在任何日志里,打印前者则是为了免去手工翻 config.json。
+function formatCursorSetup(cfg, publicBase) {
+  const lines = [];
+  if (publicBase && publicBase.url) {
+    lines.push(`Cursor Base URL: ${publicBase.url}  (ingress hostname "${publicBase.hostname}" from ${cfg.tunnel.configFile})`);
+  } else {
+    const why = (publicBase && publicBase.error) || 'unknown reason';
+    lines.push(`Cursor Base URL: unknown (${why}) -- use the tunnel's public HTTPS address + /v1; 127.0.0.1 is rejected by Cursor, see README 公网接入`);
+  }
+  lines.push(cfg.auth && cfg.auth.enabled
+    ? `Cursor API Key:  ${cfg.auth.token}  (auth.token, not the upstream apiKey)`
+    : 'Cursor API Key:  any non-empty value (auth disabled; set auth.enabled=true + auth.token to require one)');
+  return lines;
+}
+
 // 隧道子进程管理:崩溃按延迟重启;不可恢复的 spawn 失败(ENOENT/EACCES/EPERM,重启无意义)只报错不重启;
 // 任何失败都不影响代理自身对外服务。
 // 监听 'close' 而非 'exit':实测——子进程正常退出触发 'exit'+'close',
@@ -206,14 +297,19 @@ function resolveSession(mgr, reqHeaders) {
   // 同一请求探测到的所有会话头共享同一 uuid:按 PROBE_HEADERS 顺序取首个有效 TTL 命中;否则生成新 uuid 并绑定到全部出现的头。
   let uuid = null;
   const seen = [];
-  for (const h of PROBE_HEADERS) {
-    const v = reqHeaders[h];
-    if (typeof v !== 'string' || !v) continue;
-    seen.push(v);
-    if (uuid !== null) continue;
-    const hit = mgr.entries.get(v);
-    if (hit && now - hit.createdAt < mgr.cfg.ttlMs) uuid = hit.uuid;
-  }
+  const collect = (names) => {
+    for (const h of names) {
+      const v = reqHeaders[h];
+      if (typeof v !== 'string' || !v) continue;
+      seen.push(v);
+      if (uuid !== null) continue;
+      const hit = mgr.entries.get(v);
+      if (hit && now - hit.createdAt < mgr.cfg.ttlMs) uuid = hit.uuid;
+    }
+  };
+  collect(PROBE_HEADERS);
+  // 设备级兜底头只在完全没有会话头时才参与:它总是命中,若与真实会话头同场会让后者失去区分度。
+  if (seen.length === 0) collect(DEVICE_PROBE_HEADERS);
   if (uuid === null) uuid = randomUUID();
   for (const v of seen) mgr.entries.set(v, { uuid, createdAt: now });
   return uuid;
@@ -234,8 +330,12 @@ function redactHeaders(headers, authHeader) {
 }
 
 function logRequest(cfg, req, sessionId) {
-  const probed = PROBE_HEADERS
-    .map((h) => (req.headers[h] ? `${h}=${String(req.headers[h]).slice(0, 12)}…` : null))
+  const probed = [...PROBE_HEADERS, ...DEVICE_PROBE_HEADERS]
+    .map((h) => {
+      const v = req.headers[h];
+      if (!v) return null;
+      return `${DEVICE_PROBE_HEADERS.includes(h) ? `${h}(device)` : h}=${String(v).slice(0, 12)}…`;
+    })
     .filter(Boolean);
   console.log(`${new Date().toISOString()} ${req.method} ${req.url} [${probed.join(' ') || 'no-session-header'}] -> ${cfg.session.header}=${sessionId}`);
   if (cfg.log.headers) console.log('  headers:', JSON.stringify(redactHeaders(req.headers, cfg.auth?.header)));
@@ -386,11 +486,14 @@ function main() {
   const hot = createHotReloader(cfg);
   const srv = createServer(hot);
   srv.listen(cfg.port, '127.0.0.1', () => {
-    console.log(`cursor-opencode-proxy listening on http://127.0.0.1:${cfg.port} (Cursor Base URL: http://127.0.0.1:${cfg.port}/v1)`);
+    console.log(`cursor-opencode-proxy listening on http://127.0.0.1:${cfg.port} (local listen address only)`);
     console.log(`upstream: ${cfg.baseUrl} | session: ${cfg.session.strategy} via header "${cfg.session.header}"`);
     console.log(cfg.auth.enabled
       ? `auth: enabled via header "${cfg.auth.header}"`
       : 'auth: disabled (anyone who can reach this port can use your upstream key)');
+    // Cursor 必须填公网 HTTPS 地址:127.0.0.1 会被其服务端 SSRF 防护拒绝。
+    // 该地址只能来自隧道 ingress,故从 config.yml 推导;推导失败只提示,不影响启动。
+    for (const line of formatCursorSetup(cfg, derivePublicBaseUrl(cfg.tunnel, cfg.port))) console.log(line);
   });
   srv.on('error', (e) => {
     console.error(`listen failed: ${e.message} (change port in config.json or COP_PORT env)`);
@@ -430,4 +533,5 @@ module.exports = {
   loadConfig, buildUpstreamPath, filterHeaders, createSessionManager, resolveSession,
   createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
   checkAuth, buildTunnelArgs, startTunnel,
+  parseTunnelHostnames, pickPublicHost, derivePublicBaseUrl, formatCursorSetup,
 };

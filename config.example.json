@@ -18,7 +18,7 @@
     "strategy": "auto",
     "header": "x-opencode-session",
     "staticId": "00000000-0000-4000-8000-000000000000",
-    "ttlMs": 7200000
+    "ttlMs": 604800000
   },
   "log": { "headers": true, "body": false, "tunnel": false }
 }

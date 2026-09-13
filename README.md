@@ -1,19 +1,21 @@
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 # cursor-opencode-proxy
 
-OpenCode Go 后端启用强制 session routing(要求 `x-opencode-session` 头)后,Cursor 因无法配置自定义请求头而无法直连。本代理在本地替 Cursor 注入该头,SSE 流式原样透传,并通过 cloudflared 命名隧道把本地端口暴露为公网 HTTPS 端点供 Cursor 接入。
+Once the OpenCode Go backend enforced session routing (requiring an `x-opencode-session` header), Cursor could no longer connect directly, since it offers no way to configure custom request headers. This proxy injects that header on Cursor's behalf: the SSE stream is passed through untouched, and the local port is exposed as a public HTTPS endpoint through a cloudflared named tunnel for Cursor to connect to.
 
-## 使用
+## Usage
 
-1. 复制 `config.example.json` 为 `config.json`,填入 `baseUrl` 与 `apiKey`
+1. Copy `config.example.json` to `config.json` and fill in `baseUrl` and `apiKey`
 2. `node cursor-opencode-proxy.js`
-3. 通过 cloudflared 命名隧道把本地端口暴露为公网 HTTPS 端点(见「公网接入」),把该 HTTPS 地址(而非 `127.0.0.1`)作为 Cursor 的 Base URL
-4. 对话;`log.headers: true` 时控制台可见 Cursor 实际发送的会话头
+3. Expose the local port as a public HTTPS endpoint through a cloudflared named tunnel (see "Public Endpoint"), and use that HTTPS address (not `127.0.0.1`) as Cursor's Base URL
+4. Chat away; with `log.headers: true` the console shows the session headers Cursor actually sends
 
-> **重要:Cursor 无法直连 127.0.0.1。** Cursor 的 BYOK 请求由 Cursor 服务器代为发起(prompt building、context、Tab、Agent 均在服务端),因此 127.0.0.1 在 Cursor 服务器视角指向它自己,会被其 SSRF 防护拦截并返回 `403 Access to private networks is forbidden`。Base URL 必须是公网可达的 HTTPS 端点。
+> **Important: Cursor cannot connect to 127.0.0.1.** Cursor's BYOK requests are issued by Cursor's own servers (prompt building, context, Tab, and Agent all run server-side), so from that vantage point 127.0.0.1 refers to the server itself. It is blocked by their SSRF protection, which returns `403 Access to private networks is forbidden`. The Base URL must be a publicly reachable HTTPS endpoint.
 
-## 公网接入(cloudflared 命名隧道)
+## Public Endpoint (cloudflared Named Tunnel)
 
-### 一次性准备(需域名 DNS 已托管在 Cloudflare)
+### One-time setup (the domain's DNS must be hosted on Cloudflare)
 
 ```
 cloudflared tunnel login
@@ -21,119 +23,119 @@ cloudflared tunnel create cursor-proxy
 cloudflared tunnel route dns cursor-proxy proxy.example.com
 ```
 
-### config.yml 示例(Windows 路径)
+### Example config.yml (Windows paths)
 
 ```yaml
 tunnel: cursor-proxy
-credentials-file: C:\Users\<用户名>\.cloudflared\<隧道UUID>.json
+credentials-file: C:\Users\<username>\.cloudflared\<tunnel-UUID>.json
 ingress:
   - hostname: proxy.example.com
     service: http://127.0.0.1:8787
   - service: http_status:404
 ```
 
-> `ingress[0].service` 的端口必须与代理 `port` 一致(上例为 8787)。
+> The port in `ingress[0].service` must match the proxy's `port` (8787 in the example above).
 
-### 启用方式
+### Enabling it
 
-在 `config.json` 中设置鉴权与隧道:
+Configure auth and the tunnel in `config.json`:
 
-- `auth.enabled: true` 并填写 `auth.token`(或设置环境变量 `COP_AUTH_TOKEN`)
-- `tunnel.enabled: true`,并让 `tunnel.configFile` 指向上面的 `config.yml`
+- `auth.enabled: true` with `auth.token` filled in (or set the `COP_AUTH_TOKEN` environment variable)
+- `tunnel.enabled: true`, with `tunnel.configFile` pointing at the `config.yml` above
 
-启动代理后会自动拉起 cloudflared;隧道崩溃会自动重启,`cloudflared` 缺失等不可恢复错误只告警不重启,且不影响代理本身对外服务。
+Starting the proxy also starts cloudflared. If the tunnel crashes it restarts automatically; unrecoverable failures such as a missing `cloudflared` are logged as a warning without being retried, and never affect the proxy's own service.
 
-### 为何不用快速隧道(TryCloudflare)
+### Why not Quick Tunnels (TryCloudflare)
 
-官方文档明确 Quick Tunnels do not support Server-Sent Events (SSE) 且限 200 并发;cloudflared 贡献者也证实 SSE 仅在命名隧道下工作。SSE 流式透传是本项目第一目标,故只支持命名隧道。
+The official docs state that Quick Tunnels do not support Server-Sent Events (SSE) and are limited to 200 concurrent requests; cloudflared contributors have likewise confirmed that SSE only works over named tunnels. Faithful SSE pass-through is this project's primary goal, so only named tunnels are supported.
 
-## Cursor 接入
+## Connecting Cursor
 
-| Cursor 设置项 | 值 |
+| Cursor setting | Value |
 |---|---|
 | Override OpenAI Base URL | https://proxy.example.com/v1 |
-| OpenAI API Key | auth.token 的值(不是上游 apiKey) |
+| OpenAI API Key | the value of `auth.token` (not the upstream apiKey) |
 
-该地址与访问令牌都不需要手工查:启动日志会把两项都打印出来,照抄即可。
+Neither the address nor the access token needs to be looked up by hand: the startup log prints both, ready to copy.
 
 ```
-Cursor Base URL: https://proxy.example.com/v1  (ingress hostname "proxy.example.com" from C:\Users\<用户名>\.cloudflared\config.yml)
-Cursor API Key:  <config.json 中 auth.token 的值>  (not the upstream apiKey)
+Cursor Base URL: https://proxy.example.com/v1  (ingress hostname "proxy.example.com" from C:\Users\<username>\.cloudflared\config.yml)
+Cursor API Key:  <the auth.token value from config.json>  (not the upstream apiKey)
 ```
 
-抽取规则:取 `ingress` 中第一条带 `hostname` 的项;若有多条,优先取 `service` 端口与 `port` 一致的那条(末尾的 catch-all 项没有 hostname,天然被忽略)。读不到文件或没有 hostname 时只打印提示、不中断启动,此时按上表手工填写。仅支持 block style 的 `ingress`(即「公网接入」示例的写法),flow style(`- {hostname: x}`)与多行标量不会被解析。
+Derivation rules: take the first entry under `ingress` that has a `hostname`; if there are several, prefer the one whose `service` port matches `port` (the trailing catch-all entry has no hostname and is ignored by construction). If the file cannot be read or no hostname is found, the proxy only prints a note and still starts; fill in the address manually per the table above in that case. Only block-style `ingress` (the style used in the "Public Endpoint" example) is supported; flow style (`- {hostname: x}`) and multi-line scalars are not parsed.
 
-**`Cursor API Key` 一行是明文打印 `auth.token` 的**,便于直接复制;**上游 `apiKey` 不会被打印到任何日志**,不要把两者混淆。若日志可能被他人看到或截图外传,请自行判断是否接受该明文暴露(`auth.token` 泄露即等于他人可经隧道消耗你的上游额度)。`auth.enabled: false` 时该行照常打印,但不含令牌值,只提示可填任意非空值。
+**The `Cursor API Key` line prints `auth.token` in plain text**, for easy copying; **the upstream `apiKey` is never printed to any log**, so do not confuse the two. If the log may be seen by others or shared as a screenshot, judge for yourself whether that plain-text exposure is acceptable (a leaked `auth.token` means anyone can spend your upstream quota through the tunnel). When `auth.enabled: false`, the line is still printed but contains no token value, only a note that any non-empty value may be used.
 
-## 会话头与 session 策略
+## Session Header and Session Strategy
 
-Cursor 的 BYOK 覆盖端点**不带任何会话标识**——这是官方确认的现状,不是本代理的可见性问题:
+Cursor's BYOK override endpoint **sends no session identifier at all** — this is the officially confirmed status quo, not a visibility problem on this proxy's side:
 
 > "Cursor does not currently send conversation or agent identity headers (or equivalent metadata) on requests to a custom OpenAI-compatible base URL. Outbound calls to that override path effectively only carry the provider auth you'd expect, so a gateway sees anonymous completions and has to reassemble sessions after the fact."
 >
-> —— Cursor Staff,[forum.cursor.com topic 166994](https://forum.cursor.com/t/grouping-requests-into-conversations-using-an-api-gateway/166994)
+> — Cursor Staff, [forum.cursor.com topic 166994](https://forum.cursor.com/t/grouping-requests-into-conversations-using-an-api-gateway/166994)
 
-该功能请求处于 tracking 状态、无时间表(同帖 post #7);论坛亦无「用户自配自定义请求头」的支持项。而上游 OpenCode Go 明确要求客户端 `Send a stable session ID in x-opencode-session for each conversation so we can optimize routing and prompt caching`([opencode.ai/docs/go](https://opencode.ai/docs/go/))。
+That feature request is tracked with no timeline (post #7 in the same topic), and the forum offers no supported way for users to configure custom request headers either. Meanwhile OpenCode Go explicitly asks clients to `Send a stable session ID in x-opencode-session for each conversation so we can optimize routing and prompt caching` ([opencode.ai/docs/go](https://opencode.ai/docs/go/)).
 
-因此 `auto` 策略的实际行为是:
+So in practice the `auto` strategy behaves like this:
 
-1. 按顺序探测 `x-session-id` → `x-client-session-id` → `x-request-id`(Cursor 目前一个都不发);
-2. **一个都探测不到时**回落到设备级兜底头 `cf-warp-tag-id`(Cloudflare 注入,跨请求稳定);
-3. 连兜底头也没有(例如不经 Cloudflare 直连)才降级为每请求新 UUID。
+1. Probe `x-session-id` → `x-client-session-id` → `x-request-id` in order (Cursor currently sends none of them);
+2. **When none of them is present**, fall back to the device-level header `cf-warp-tag-id` (injected by Cloudflare, stable across requests);
+3. Only when even that fallback is absent (for example a direct connection that bypasses Cloudflare) does it degrade to a fresh UUID per request.
 
-代价与边界: 同一设备的所有 Cursor 对话会共用同一个上游 session——这是**过渡妥协**(换取 routing 与 prompt caching 的复用,代价是对话之间不再区分)。一旦请求中出现任何真实会话头,兜底头立即不参与,不会污染更精确的映射。日志中设备级兜底标注为 `cf-warp-tag-id(device)=…`。
+Cost and boundaries: every Cursor conversation on the same device shares one upstream session — a **transitional compromise** (reusing routing and prompt caching in exchange for no longer distinguishing between conversations). As soon as any real session header appears in a request, the fallback drops out immediately and never pollutes a more precise mapping. The device-level fallback is labelled `cf-warp-tag-id(device)=…` in the log.
 
-更精确的做法(同一对话复用、不同对话区分)需按请求体 `messages` 前缀指纹生成会话键,这要求解析 body,与当前「原样透传、不解析」的设计冲突,尚未实现。
+A more precise approach (same conversation reuses, different conversations distinguished) would derive the session key from a fingerprint of the request body's `messages` prefix. That requires parsing the body, which conflicts with the current "pass through untouched, never parse" design, and is not implemented.
 
-### 映射表的生命周期(为什么隔一晚 session 就变了)
+### Lifetime of the Mapping Table (why the session changes after a night away)
 
-即使 `cf-warp-tag-id` 一直没变,注入的 `x-opencode-session` 也可能换新。有两种成因,都与设备标识无关:
+Even when `cf-warp-tag-id` never changes, the injected `x-opencode-session` can still be renewed. There are two causes, neither related to the device identifier:
 
-1. **TTL 到期(`session.ttlMs`,滑动窗口)。** 判定与续期在 `resolveSession`:`now - createdAt < ttlMs` 才算命中,而每次命中都会把 `createdAt` 刷新为当前时间。因此**相邻两次请求间隔小于 `ttlMs` 就持续续期、永不换新;一旦停用超过 `ttlMs`,下一条请求即生成新 UUID**。代码内置默认 2 小时对"隔夜使用"必然失效,故 `config.example.json` 与本地 `config.json` 均取 7 天(`604800000`)。
-2. **代理进程重启。** 映射表是纯内存 `Map`(`createSessionManager`),不落盘。重启进程或重启机器后,同一个 `cf-warp-tag-id` 也会拿到新 UUID——这一条**调大 `ttlMs` 解决不了**。
+1. **TTL expiry (`session.ttlMs`, a sliding window).** The check and renewal live in `resolveSession`: only `now - createdAt < ttlMs` counts as a hit, and every hit refreshes `createdAt` to the current time. So **as long as the gap between consecutive requests is under `ttlMs` the session keeps renewing and never changes; once the proxy sits idle longer than `ttlMs`, the next request gets a new UUID**. The built-in default of 2 hours is bound to fail for "leave it overnight" usage, so both `config.example.json` and the local `config.json` use 7 days (`604800000`).
+2. **Proxy process restart.** The mapping table is a plain in-memory `Map` (`createSessionManager`) and is never persisted. After a process or machine restart, the same `cf-warp-tag-id` gets a new UUID too — **raising `ttlMs` cannot fix this one**.
 
-区分方法:看日志里有没有新的启动横幅(`cursor-opencode-proxy listening on …`)。没有横幅、只有 `-> x-opencode-session=` 变了,是 TTL 到期;有横幅,则是进程重启。另外 `cleanupSessionMap` 每小时回收过期条目,其删除条件与判定条件相同,只释放内存,不改变上述行为。
+How to tell them apart: check the log for a fresh startup banner (`cursor-opencode-proxy listening on …`). No banner, with only `-> x-opencode-session=` changing, means TTL expiry; a banner means a process restart. Separately, `cleanupSessionMap` reclaims expired entries once an hour; its deletion condition is identical to the check condition, so it only frees memory and does not change the behaviour above.
 
-> `session.*` 支持热重载:改 `ttlMs` 保存即生效,无需重启;映射表中按新 `ttlMs` 仍算未过期的旧条目会继续复用。
+> `session.*` supports hot reload: saving a new `ttlMs` takes effect immediately with no restart; existing entries in the mapping table that still count as unexpired under the new `ttlMs` keep being reused.
 
-## 配置
+## Configuration
 
-| 字段 | 默认 | 说明 |
+| Field | Default | Description |
 |---|---|---|
-| port | 8787 | 监听端口(仅 127.0.0.1) |
-| baseUrl | (必填) | 上游 OpenAI 兼容端点(http/https) |
-| apiKey | (必填) | 上游 API key |
-| auth.enabled | false | 是否要求访问令牌才能经本代理调用上游 |
-| auth.header | authorization | 携带访问令牌的请求头名 |
-| auth.token | "" | 访问令牌(auth.enabled=true 时必填) |
-| tunnel.enabled | false | 是否自动拉起 cloudflared 命名隧道 |
-| tunnel.binary | cloudflared | cloudflared 可执行文件路径/命令名 |
-| tunnel.name | cursor-proxy | 命名隧道名称 |
-| tunnel.configFile | "" | cloudflared 配置(config.yml)路径 |
-| tunnel.restartDelayMs | 5000 | 隧道崩溃后重启延迟(毫秒) |
+| port | 8787 | Listening port (127.0.0.1 only) |
+| baseUrl | (required) | Upstream OpenAI-compatible endpoint (http/https) |
+| apiKey | (required) | Upstream API key |
+| auth.enabled | false | Whether an access token is required to call the upstream through this proxy |
+| auth.header | authorization | Name of the header carrying the access token |
+| auth.token | "" | Access token (required when auth.enabled=true) |
+| tunnel.enabled | false | Whether to start the cloudflared named tunnel automatically |
+| tunnel.binary | cloudflared | Path to / command name of the cloudflared executable |
+| tunnel.name | cursor-proxy | Named tunnel name |
+| tunnel.configFile | "" | Path to the cloudflared config (config.yml) |
+| tunnel.restartDelayMs | 5000 | Delay before restarting the tunnel after a crash (ms) |
 | session.strategy | auto | auto / per-request / static |
-| session.header | x-opencode-session | 注入的请求头名 |
-| session.staticId | 00000000-… | strategy=static 时注入的固定值 |
-| session.ttlMs | 7200000 | 会话 key → 注入 UUID 映射的存续期(毫秒)。滑动窗口:命中即续期,停用超过该值则下次换新(见「映射表的生命周期」);`config.example.json` 已取 604800000(7 天)以适配隔夜使用 |
-| log.headers | true | 打印收到的请求头(Authorization 脱敏) |
-| log.body | false | 打印请求 body 前 2KB |
-| log.tunnel | false | 透传 cloudflared 子进程输出(stdio inherit) |
+| session.header | x-opencode-session | Name of the injected header |
+| session.staticId | 00000000-… | Fixed value injected when strategy=static |
+| session.ttlMs | 7200000 | Lifetime (ms) of the session key → injected UUID mapping. Sliding window: a hit renews it, and going idle longer than this value means the next request gets a new one (see "Lifetime of the Mapping Table"); `config.example.json` uses 604800000 (7 days) to suit overnight usage |
+| log.headers | true | Print received request headers (Authorization redacted) |
+| log.body | false | Print the first 2 KB of the request body |
+| log.tunnel | false | Pass through cloudflared subprocess output (stdio inherit) |
 
-- 环境变量 `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` 可覆盖对应字段,热重载后依然生效
-- `auth.header` 与 `session.header` 不能相同(同名会覆盖上游 Authorization 头导致上游 401),无论鉴权是否开启都会在启动时拒绝
-- 修改 `config.json` 保存即热重载;非法配置保留旧配置并告警;端口变更与 `tunnel.*` 变更需重启进程
-- 首次启动若无 `config.json`,自动从模板复制后退出
+- The environment variables `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` override the corresponding fields, and keep doing so after a hot reload
+- `auth.header` and `session.header` must not be the same (sharing a name would overwrite the upstream Authorization header and cause an upstream 401); this is rejected at startup whether or not auth is enabled
+- Saving `config.json` triggers a hot reload; an invalid config keeps the old one and logs a warning; port changes and `tunnel.*` changes require a process restart
+- On first start, if `config.json` does not exist, it is copied from the template and the process exits
 
-## 升级注意
+## Upgrade Notes
 
-本版本有四处行为变化值得注意:
+There are four behaviour changes worth noting in this version:
 
-1. **`auto` 策略新增设备级兜底头。** 当一个会话头都探测不到时(正是 Cursor 的实况),改用 `cf-warp-tag-id` 作为会话键,于是同一设备的请求不再每请求新 UUID,而是复用同一个上游 session;连该头也没有时仍降级为每请求新 UUID。语义与出处见「会话头与 session 策略」。
-2. **`session.ttlMs` 的取值由 2 小时改为 7 天(`604800000`)。** 该值是滑动窗口的存续期,停用超过它就会换新注入的 session;原 2 小时意味着隔夜后必然换新,使上游的 session routing / prompt caching 归零。代码内置默认未变(仍为 `7200000`),改的是 `config.example.json` 模板与本地 `config.json`;需要更长或更短可自行调整,`session.*` 保存即热重载。注意它**解决不了进程重启导致的换新**(映射表在内存中),详见「映射表的生命周期」。
-3. **`auth.header` 与 `session.header` 不能同名。** 若旧配置把两者配成同一个字段(例如都为 `x-opencode-session`),启动会被拒绝并报 `config: auth.header and session.header must differ`。原因是 `proxyRequest` 会无条件写入 `headers['authorization'] = Bearer <上游 apiKey>`,随后 `headers[session.header] = <sessionId>` 若与之同名会覆盖上游鉴权头,导致上游 401。请把 `session.header` 改回 `x-opencode-session`(默认值)或另选一个不冲突的名字。
-4. **Cursor 的 Base URL 不能再填 `http://127.0.0.1:8787/v1`。** 该做法经查实不可用:Cursor 的 BYOK 请求由 Cursor 服务端代发,其 SSRF 防护会拒绝私有网段并返回 `403 Access to private networks is forbidden`。须改用 cloudflared 命名隧道暴露的公网 HTTPS 地址,见「公网接入」。
+1. **The `auto` strategy gained a device-level fallback header.** When no session header is detected at all (which is exactly Cursor's situation), `cf-warp-tag-id` is used as the session key, so requests from the same device no longer get a fresh UUID each time but reuse one upstream session; when even that header is absent it still degrades to a fresh UUID per request. For the semantics and their source, see "Session Header and Session Strategy".
+2. **`session.ttlMs` changed from 2 hours to 7 days (`604800000`).** This value is the lifetime of the sliding window; going idle longer than it renews the injected session. The old 2 hours meant it was guaranteed to renew overnight, resetting the upstream's session routing / prompt caching to zero. The built-in code default is unchanged (still `7200000`); what changed is the `config.example.json` template and the local `config.json`. Adjust it longer or shorter as you like — `session.*` takes effect on save via hot reload. Note that it **cannot fix renewal caused by a process restart** (the mapping table lives in memory); see "Lifetime of the Mapping Table" for details.
+3. **`auth.header` and `session.header` must not be the same.** If an old config set both to the same field (for example both `x-opencode-session`), startup is rejected with `config: auth.header and session.header must differ`. The reason is that `proxyRequest` unconditionally writes `headers['authorization'] = Bearer <upstream apiKey>`, and if `headers[session.header] = <sessionId>` shares that name it overwrites the upstream auth header, causing an upstream 401. Set `session.header` back to `x-opencode-session` (the default) or pick another non-conflicting name.
+4. **Cursor's Base URL can no longer be `http://127.0.0.1:8787/v1`.** That approach has been verified unusable: Cursor's BYOK requests are issued by Cursor's servers, whose SSRF protection rejects private network ranges and returns `403 Access to private networks is forbidden`. Use the public HTTPS address exposed by the cloudflared named tunnel instead; see "Public Endpoint".
 
-## 测试
+## Tests
 
 ```
 node --test tests/*.js

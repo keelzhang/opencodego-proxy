@@ -98,6 +98,51 @@ How to tell them apart: check the log for a fresh startup banner (`cursor-openco
 
 > `session.*` supports hot reload: saving a new `ttlMs` takes effect immediately with no restart; existing entries in the mapping table that still count as unexpired under the new `ttlMs` keep being reused.
 
+### DeepSeek Thinking Mode and `reasoning_content` (the long-session 400)
+
+With a DeepSeek upstream you may hit a 400 that **only shows up in long sessions**:
+
+```
+Error from provider (Console Go): Upstream request failed:
+[invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API.
+```
+
+Why (per DeepSeek's [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode) docs):
+
+- Thinking mode is **on by default** (default effort `high`). There is nothing to configure, in Cursor or elsewhere.
+- Whenever a request **carries the `tools` parameter**, every historical assistant message must send `reasoning_content` back, or the API returns 400.
+- Cursor speaks the standard OpenAI protocol and neither knows nor preserves that non-standard field, so the error becomes inevitable once enough tool-calling rounds accumulate (short sessions often work fine).
+
+The proxy handles this in two stages (both on by default):
+
+| Option | Default | Effect |
+|---|---|---|
+| reasoning.replay | true | **A**: while the response streams through, extract `reasoning_content` out-of-band and cache it by assistant-message fingerprint, then fill it back into the next request. Cursor is unaffected; the cost is that the proxy must parse the body (unparseable bodies pass through untouched). |
+| reasoning.fallbackDisabled | true | **B**: if a 400 still mentions `reasoning_content`, inject `thinking:{"type":"disabled"}` and retry once; the client just sees the successful response. The cost is losing thinking from that turn on. |
+| reasoning.cacheTtlMs | 7200000 | Cache lifetime (ms). |
+| reasoning.maxEntries | 2000 | Cache capacity; the oldest entry is evicted beyond it. |
+
+The log prints `[reasoning] replayed …` (fill succeeded), `[reasoning] cached …`, `[reasoning] N assistant message(s) … lack cached` (cache miss, A failed) and `[reasoning] … retrying once with thinking=disabled` (fallback B). **Frequent cache-miss warnings** mean the client compacted the conversation history so the fingerprints no longer match: A fails and B takes over, which drops thinking for that session.
+
+> To sidestep the whole issue, switch Cursor to a non-DeepSeek model (e.g. `glm-5.3-flash`). B only injects when the 400 above occurs, and never affects other models.
+
+**Two inherent limits of A:**
+
+1. **It cannot help with history predating the feature.** A only caches responses captured *while the proxy is running*. If a conversation already accumulated many tool-calling rounds before this was enabled (the log line `[reasoning] 106 assistant message(s) ... lack cached` is exactly that), those turns' `reasoning_content` was never captured and cannot be filled back — **it only works from a new conversation onward**.
+2. **Client-side compaction breaks the fingerprints**, as described above.
+
+In either case B takes over, at the cost of losing thinking for that session.
+
+### Diagnosing upstream 401s (and other errors)
+
+`log.upstreamErrors` (on by default) writes the upstream 4xx/5xx response body into the log:
+
+```
+[upstream] 401 body: {"error":{"message":"..."}}
+```
+
+This matters: the proxy **passes error responses through without parsing them**, so the body would otherwise only ever reach Cursor. The `[hint] upstream 401: check ... session routing` line is a **generic guess based on the status code, not necessarily the real cause** (401 is more often about auth or quota than about sessions). Trust the actual `[upstream] ... body:` content.
+
 ## Configuration
 
 | Field | Default | Description |
@@ -120,6 +165,11 @@ How to tell them apart: check the log for a fresh startup banner (`cursor-openco
 | log.headers | true | Print received request headers (Authorization redacted) |
 | log.body | false | Print the first 2 KB of the request body |
 | log.tunnel | false | Pass through cloudflared subprocess output (stdio inherit) |
+| log.upstreamErrors | true | Log the upstream error body on 4xx/5xx (truncated to 1000 chars), for diagnosing 401/400 |
+| reasoning.replay | true | Fill cached `reasoning_content` back (approach A; see "DeepSeek Thinking Mode and reasoning_content") |
+| reasoning.fallbackDisabled | true | Inject `thinking=disabled` and retry once on the 400 (approach B) |
+| reasoning.cacheTtlMs | 7200000 | Lifetime of the reasoning cache (ms) |
+| reasoning.maxEntries | 2000 | Capacity of the reasoning cache |
 
 - The environment variables `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` override the corresponding fields, and keep doing so after a hot reload
 - `auth.header` and `session.header` must not be the same (sharing a name would overwrite the upstream Authorization header and cause an upstream 401); this is rejected at startup whether or not auth is enabled

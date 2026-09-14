@@ -38,7 +38,8 @@ function loadConfig(file, env = process.env) {
     auth: { enabled: false, header: 'authorization', token: '' },
     tunnel: { enabled: false, binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 },
     session: { strategy: 'auto', header: 'x-opencode-session', staticId: '00000000-0000-4000-8000-000000000000', ttlMs: 7200000 },
-    log: { headers: true, body: false, tunnel: false },
+    reasoning: { replay: true, fallbackDisabled: true, cacheTtlMs: 7200000, maxEntries: 2000 },
+    log: { headers: true, body: false, tunnel: false, upstreamErrors: true },
   };
   const missing = [];
   if (typeof parsed.baseUrl === 'string' && parsed.baseUrl) cfg.baseUrl = parsed.baseUrl.replace(/\/+$/, '');
@@ -98,10 +99,17 @@ function loadConfig(file, env = process.env) {
   if (cfg.tunnel.enabled && !cfg.tunnel.name.trim()) {
     throw new Error(`config: invalid tunnel.name: ${JSON.stringify(cfg.tunnel.name)} (must be non-empty)`);
   }
+  if (parsed.reasoning && typeof parsed.reasoning === 'object') {
+    if (typeof parsed.reasoning.replay === 'boolean') cfg.reasoning.replay = parsed.reasoning.replay;
+    if (typeof parsed.reasoning.fallbackDisabled === 'boolean') cfg.reasoning.fallbackDisabled = parsed.reasoning.fallbackDisabled;
+    if (Number.isInteger(parsed.reasoning.cacheTtlMs) && parsed.reasoning.cacheTtlMs > 0) cfg.reasoning.cacheTtlMs = parsed.reasoning.cacheTtlMs;
+    if (Number.isInteger(parsed.reasoning.maxEntries) && parsed.reasoning.maxEntries > 0) cfg.reasoning.maxEntries = parsed.reasoning.maxEntries;
+  }
   if (parsed.log && typeof parsed.log === 'object') {
     if (typeof parsed.log.headers === 'boolean') cfg.log.headers = parsed.log.headers;
     if (typeof parsed.log.body === 'boolean') cfg.log.body = parsed.log.body;
     if (typeof parsed.log.tunnel === 'boolean') cfg.log.tunnel = parsed.log.tunnel;
+    if (typeof parsed.log.upstreamErrors === 'boolean') cfg.log.upstreamErrors = parsed.log.upstreamErrors;
   }
   return cfg;
 }
@@ -348,8 +356,137 @@ function sendOpenAIError(res, status, message) {
   res.end(body);
 }
 
+// ---- reasoning_content 回放(A)与降级(B) ----
+// 背景:DeepSeek thinking mode 下,凡请求带 tools,历史 assistant 消息必须回传 reasoning_content,否则上游 400。
+// Cursor 走 OpenAI 标准协议,不保留该非标准字段,故长会话必然撞上(见 README)。
+// A:透传响应时旁路提取 reasoning_content,按 assistant 消息指纹缓存;下次请求回填。
+// B:若仍 400 且错误体提及 reasoning_content,注入 thinking.type=disabled 重发一次。
+
+function createReasoningCache() {
+  return { entries: new Map() }; // fingerprint -> { reasoning_content, createdAt }
+}
+
+// assistant 消息指纹:不含 tool_call id 与首尾空白,容忍客户端对消息的轻微规范化
+function messageFingerprint(msg) {
+  if (!msg || typeof msg !== 'object' || msg.role !== 'assistant') return null;
+  const content = typeof msg.content === 'string' ? msg.content.trim() : '';
+  const calls = Array.isArray(msg.tool_calls)
+    ? msg.tool_calls.map((c) => {
+      const fn = c && c.function ? c.function : {};
+      return `${fn.name == null ? '' : fn.name}(${fn.arguments == null ? '' : String(fn.arguments)})`;
+    })
+    : [];
+  if (!content && !calls.length) return null; // 空 assistant 消息无法可靠关联
+  return crypto.createHash('sha256').update(JSON.stringify([content, calls]), 'utf8').digest('hex').slice(0, 32);
+}
+
+// 非流式响应体 -> assistant 消息
+function extractAssistantFromJson(text) {
+  try {
+    const j = JSON.parse(text);
+    const msg = j && Array.isArray(j.choices) && j.choices[0] ? j.choices[0].message : null;
+    return msg && typeof msg === 'object' ? msg : null;
+  } catch { return null; }
+}
+
+// 流式 SSE -> 累积 delta 重组 assistant 消息(含 reasoning_content 与 tool_calls)
+function extractAssistantFromSse(text) {
+  const out = { role: 'assistant', content: '' };
+  const calls = new Map();
+  let sawData = false;
+  for (const rawLine of String(text).split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === '[DONE]') continue;
+    let j;
+    try { j = JSON.parse(payload); } catch { continue; }
+    const delta = j && Array.isArray(j.choices) && j.choices[0] ? j.choices[0].delta : null;
+    if (!delta) continue;
+    sawData = true;
+    if (typeof delta.content === 'string') out.content += delta.content;
+    if (typeof delta.reasoning_content === 'string') out.reasoning_content = (out.reasoning_content || '') + delta.reasoning_content;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc && Number.isInteger(tc.index) ? tc.index : 0;
+        const cur = calls.get(idx) || { name: '', arguments: '' };
+        if (tc && tc.function) {
+          if (typeof tc.function.name === 'string') cur.name += tc.function.name;
+          if (typeof tc.function.arguments === 'string') cur.arguments += tc.function.arguments;
+        }
+        calls.set(idx, cur);
+      }
+    }
+  }
+  if (!sawData) return null;
+  if (calls.size) out.tool_calls = [...calls.keys()].sort((a, b) => a - b).map((k) => ({ type: 'function', function: calls.get(k) }));
+  return out;
+}
+
+function extractAssistant(text) {
+  return extractAssistantFromJson(text) || extractAssistantFromSse(text);
+}
+
+// 缓存上游 assistant 消息的 reasoning_content
+function rememberReasoning(cache, msg, rcfg) {
+  const fp = messageFingerprint(msg);
+  if (!fp || !msg || typeof msg.reasoning_content !== 'string' || !msg.reasoning_content) return false;
+  cache.entries.set(fp, { reasoning_content: msg.reasoning_content, createdAt: Date.now() });
+  if (cache.entries.size > rcfg.maxEntries) { // 容量上限:淘汰最旧
+    let oldestKey = null;
+    let oldest = Infinity;
+    for (const [k, v] of cache.entries) if (v.createdAt < oldest) { oldest = v.createdAt; oldestKey = k; }
+    if (oldestKey !== null) cache.entries.delete(oldestKey);
+  }
+  return true;
+}
+
+function recallReasoning(cache, fp, rcfg) {
+  const hit = cache.entries.get(fp);
+  if (!hit) return null;
+  if (Date.now() - hit.createdAt >= rcfg.cacheTtlMs) { cache.entries.delete(fp); return null; }
+  return hit.reasoning_content;
+}
+
+// A:回填。返回 { body, filled, missing };非 JSON / 非 chat 体 / 无可回填时 body 原样返回。
+function replayReasoning(buf, cache, rcfg) {
+  let parsed;
+  try { parsed = JSON.parse(buf.toString('utf8')); } catch { return { body: buf, filled: 0, missing: 0 }; }
+  if (!parsed || !Array.isArray(parsed.messages)) return { body: buf, filled: 0, missing: 0 };
+  // 仅请求带 tools 时才需要回传(官方:不带 tools 时 reasoning_content 被忽略但仍计费)
+  if (!Array.isArray(parsed.tools) || !parsed.tools.length) return { body: buf, filled: 0, missing: 0 };
+  let filled = 0;
+  let missing = 0;
+  for (const m of parsed.messages) {
+    if (!m || m.role !== 'assistant') continue;
+    if (typeof m.reasoning_content === 'string' && m.reasoning_content) continue;
+    const fp = messageFingerprint(m);
+    if (!fp) continue;
+    const rc = recallReasoning(cache, fp, rcfg);
+    if (rc) { m.reasoning_content = rc; filled += 1; }
+    else if (Array.isArray(m.tool_calls) && m.tool_calls.length) missing += 1;
+  }
+  if (!filled) return { body: buf, filled: 0, missing };
+  return { body: Buffer.from(JSON.stringify(parsed), 'utf8'), filled, missing };
+}
+
+// B:注入 thinking disabled(不可解析时返回 null,调用方退回原样透传)
+function injectThinkingDisabled(buf) {
+  let parsed;
+  try { parsed = JSON.parse(buf.toString('utf8')); } catch { return null; }
+  if (!parsed || typeof parsed !== 'object') return null;
+  parsed.thinking = { type: 'disabled' };
+  return Buffer.from(JSON.stringify(parsed), 'utf8');
+}
+
+function looksLikeReasoningError(text) {
+  return typeof text === 'string' && /reasoning_content/i.test(text);
+}
+
 function createHotReloader(cfg) {
-  return { config: cfg, sessionMgr: createSessionManager(cfg.session) };
+  // 兜底:测试与外部调用可能直接构造 cfg(不经 loadConfig)。缺省视为关闭两项新能力,保持"纯透传"语义。
+  if (!cfg.reasoning) cfg.reasoning = { replay: false, fallbackDisabled: false, cacheTtlMs: 7200000, maxEntries: 2000 };
+  return { config: cfg, sessionMgr: createSessionManager(cfg.session), reasoningCache: createReasoningCache() };
 }
 
 function proxyRequest(req, res, hot) {
@@ -392,33 +529,93 @@ function proxyRequest(req, res, hot) {
       headers['authorization'] = `Bearer ${cfg.apiKey}`;
       headers[cfg.session.header] = sessionId;
       const mod = cfg.baseUrl.startsWith('https:') ? https : http;
-      const upReq = mod.request(cfg.baseUrl, {
-        method: req.method,
-        path: buildUpstreamPath(cfg.baseUrl, req.url),
-        headers,
-        timeout: UPSTREAM_TIMEOUT_MS,
-      }, (upRes) => {
-        console.log(`${new Date().toISOString()} ${req.method} ${req.url} upstream=${upRes.statusCode}`); // 规格 5.5:每请求一行上游状态
-        res.writeHead(upRes.statusCode, filterHeaders(upRes.headers));
-        upRes.pipe(res); // 纯透传:不缓冲、不解析、不重组
-        upRes.on('error', () => res.destroy());
-        if (SESSION_HINT_STATUS.has(upRes.statusCode)) {
-          console.warn(`[hint] upstream ${upRes.statusCode}: check ${cfg.session.header} injection / upstream session routing (spec 5.4)`);
-        }
-      });
-      upReq.on('timeout', () => {
-        sendOpenAIError(res, 504, `upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`);
-        upReq.destroy();
-      });
-      upReq.on('error', (e) => {
-        if (!res.headersSent) sendOpenAIError(res, 502, `upstream request failed: ${e.message}`);
-        else res.destroy();
-      });
+      const MAX_CAPTURE = 2 * 1024 * 1024; // 响应旁路采集上限:只用于提取 reasoning_content 与错误诊断,不参与透传
+      const LOG_ERROR_BODY = 1000; // 上游错误体在日志中的截断长度
+      let currentUpReq = null;
+      // 发送上行请求。allowFallback=true 时,遇 400 且错误体提及 reasoning_content 会注入 thinking=disabled 重发一次。
+      const sendUpstream = (sendBody, allowFallback) => {
+        const upReq = mod.request(cfg.baseUrl, {
+          method: req.method,
+          path: buildUpstreamPath(cfg.baseUrl, req.url),
+          headers,
+          timeout: UPSTREAM_TIMEOUT_MS,
+        }, (upRes) => {
+          const status = upRes.statusCode;
+          console.log(`${new Date().toISOString()} ${req.method} ${req.url} upstream=${status}`); // 规格 5.5:每请求一行上游状态
+          // A:旁路采集成功响应,提取 reasoning_content 以备下轮回填。不阻断 pipe,采集失败只影响回放。
+          if (status === 200 && cfg.reasoning.replay && req.method === 'POST') {
+            const cap = [];
+            let capSize = 0;
+            upRes.on('data', (c) => { if (capSize < MAX_CAPTURE) { cap.push(c); capSize += c.length; } });
+            upRes.on('end', () => {
+              try {
+                const msg = extractAssistant(Buffer.concat(cap).toString('utf8'));
+                if (msg && rememberReasoning(hot.reasoningCache, msg, cfg.reasoning)) {
+                  console.log(`[reasoning] cached ${msg.reasoning_content.length} chars for replay`);
+                }
+              } catch { /* 采集失败不得影响透传 */ }
+            });
+          }
+          // 上游错误:先采集并打印错误体。此前 401 的根因之所以无法确诊,就是因为错误体被直接透传、代理未留痕。
+          // 其中 400 且提及 reasoning_content 时降级重发(B)。
+          if (status >= 400) {
+            const errChunks = [];
+            let errSize = 0;
+            upRes.on('data', (c) => { if (errSize < MAX_CAPTURE) { errChunks.push(c); errSize += c.length; } });
+            upRes.on('end', () => {
+              const errText = Buffer.concat(errChunks).toString('utf8');
+              if (cfg.log?.upstreamErrors !== false && errText) {
+                console.warn(`[upstream] ${status} body: ${errText.slice(0, LOG_ERROR_BODY)}`);
+              }
+              if (allowFallback && status === 400 && cfg.reasoning.fallbackDisabled && looksLikeReasoningError(errText)) {
+                const fallback = injectThinkingDisabled(sendBody);
+                if (fallback) {
+                  console.warn('[reasoning] upstream 400 mentions reasoning_content; retrying once with thinking=disabled (thinking lost for this turn)');
+                  sendUpstream(fallback, false);
+                  return;
+                }
+              }
+              // 原样交回客户端(错误体小,已完整采集;content-length 交 Node 重算)
+              if (res.headersSent) { res.destroy(); return; }
+              const outHeaders = filterHeaders(upRes.headers);
+              delete outHeaders['content-length'];
+              res.writeHead(status, outHeaders);
+              res.end(errText);
+            });
+            upRes.on('error', () => { if (!res.headersSent) sendOpenAIError(res, 502, 'upstream response stream error'); });
+            return;
+          }
+          res.writeHead(status, filterHeaders(upRes.headers));
+          upRes.pipe(res); // 纯透传:不缓冲、不解析、不重组
+          upRes.on('error', () => res.destroy());
+          if (SESSION_HINT_STATUS.has(status)) {
+            console.warn(`[hint] upstream ${status}: check ${cfg.session.header} injection / upstream session routing (spec 5.4)`);
+          }
+        });
+        currentUpReq = upReq;
+        upReq.on('timeout', () => {
+          sendOpenAIError(res, 504, `upstream timeout after ${UPSTREAM_TIMEOUT_MS}ms`);
+          upReq.destroy();
+        });
+        upReq.on('error', (e) => {
+          if (!res.headersSent) sendOpenAIError(res, 502, `upstream request failed: ${e.message}`);
+          else res.destroy();
+        });
+        if (sendBody.length) upReq.write(sendBody);
+        upReq.end();
+      };
       res.on('close', () => {
-        if (!res.writableEnded) upReq.destroy(); // 客户端断连 → 中止上游
+        if (!res.writableEnded && currentUpReq) currentUpReq.destroy(); // 客户端断连 → 中止上游
       });
-      if (body.length) upReq.write(body);
-      upReq.end();
+      // A:转发前回填 reasoning_content(仅请求带 tools 时才有意义;解析失败则原样透传)
+      let outBody = body;
+      if (cfg.reasoning.replay && body.length) {
+        const r = replayReasoning(body, hot.reasoningCache, cfg.reasoning);
+        outBody = r.body;
+        if (r.filled) console.log(`[reasoning] replayed reasoning_content into ${r.filled} assistant message(s)`);
+        if (r.missing) console.warn(`[reasoning] ${r.missing} assistant message(s) with tool_calls lack cached reasoning_content; upstream may reject (see README 已知限制)`);
+      }
+      sendUpstream(outBody, true);
     } catch (e) {
       // 同步段兜底(如非法 baseUrl):不让异常逸出崩溃进程,统一转 502 OpenAI 错误格式。
       sendOpenAIError(res, 502, `upstream request failed: ${e.message}`);
@@ -534,4 +731,6 @@ module.exports = {
   createHotReloader, proxyRequest, createServer, applyHotConfig, cleanupSessionMap, watchConfig,
   checkAuth, buildTunnelArgs, startTunnel,
   parseTunnelHostnames, pickPublicHost, derivePublicBaseUrl, formatCursorSetup,
+  createReasoningCache, messageFingerprint, extractAssistant, extractAssistantFromJson, extractAssistantFromSse,
+  rememberReasoning, recallReasoning, replayReasoning, injectThinkingDisabled, looksLikeReasoningError,
 };

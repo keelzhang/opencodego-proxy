@@ -98,6 +98,51 @@ Cursor 的 BYOK 覆盖端点**不带任何会话标识**——这是官方确认
 
 > `session.*` 支持热重载:改 `ttlMs` 保存即生效,无需重启;映射表中按新 `ttlMs` 仍算未过期的旧条目会继续复用。
 
+### DeepSeek thinking 与 reasoning_content(长会话 400 的处置)
+
+若上游是 DeepSeek 系模型,会出现一种**长会话才触发**的 400:
+
+```
+Error from provider (Console Go): Upstream request failed:
+[invalid_request_error] The `reasoning_content` in the thinking mode must be passed back to the API.
+```
+
+原因(见 DeepSeek 官方 [Thinking Mode](https://api-docs.deepseek.com/guides/thinking_mode)):
+
+- thinking 模式**默认开启**(默认 effort `high`),客户端无需也无法在 Cursor 里配置;
+- 只要请求**带 `tools` 参数**,历史每一轮 assistant 消息都必须回传 `reasoning_content`,否则返回 400;
+- 而 Cursor 走标准 OpenAI 协议,**不认识也不保留**这个非标准字段,故多轮工具调用累积到一定规模后必然触发(短会话可能一直正常)。
+
+代理提供两级处置(默认都开):
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| reasoning.replay | true | **A**:透传响应时旁路提取 `reasoning_content` 并按 assistant 消息指纹缓存,下次请求回填。Cursor 侧无感,代价是代理需解析 body(解析失败自动原样透传)。 |
+| reasoning.fallbackDisabled | true | **B**:若仍收到 400 且错误体提及 `reasoning_content`,自动注入 `thinking:{"type":"disabled"}` 重发一次,成功后客户端无感。代价是该轮起失去 thinking。 |
+| reasoning.cacheTtlMs | 7200000 | 缓存存续期(毫秒)。 |
+| reasoning.maxEntries | 2000 | 缓存条目上限,超出淘汰最旧。 |
+
+日志会打印 `[reasoning] replayed …`(回填成功)、`[reasoning] cached …`(缓存成功)、`[reasoning] N assistant message(s) … lack cached`(未命中,A 失效)与 `[reasoning] … retrying once with thinking=disabled`(降级 B)。**未命中告警频繁出现**说明会话历史被客户端压缩(compaction)、指纹对不上——此时 A 失效而由 B 兜底,该会话会失去 thinking。
+
+> 想彻底避开:在 Cursor 里换用非 DeepSeek 模型(如 `glm-5.3-flash`)。B 的注入仅在上述 400 出现时发生,不影响其它模型。
+
+**A 的两个固有局限**:
+
+1. **对启用前的历史无效。** A 只能缓存「代理运行期间捕获到的上游响应」。若某会话在启用本功能前就已积累大量工具调用轮次(例如日志中的 `[reasoning] 106 assistant message(s) ... lack cached`),这些轮的 `reasoning_content` 从未被捕获过,A 补不上——**必须从新会话开始才有效**。
+2. **客户端压缩(compaction)会使指纹失配**,见上。
+
+两种情况都有 B 兜底,代价是该会话失去 thinking。
+
+### 上游 401 / 其它错误如何确诊
+
+`log.upstreamErrors`(默认开)会把上游返回的 4xx/5xx 响应体写进日志:
+
+```
+[upstream] 401 body: {"error":{"message":"..."}}
+```
+
+这很关键:代理对错误响应**只透传、不解析**,错误体原本只流向 Cursor;而日志里那行 `[hint] upstream 401: check ... session routing` 只是按状态码给出的**通用猜测,未必是真实原因**(401 更常与鉴权或配额有关,而非 session)。请以 `[upstream] ... body:` 的实际内容为准。
+
 ## 配置
 
 | 字段 | 默认 | 说明 |
@@ -120,6 +165,11 @@ Cursor 的 BYOK 覆盖端点**不带任何会话标识**——这是官方确认
 | log.headers | true | 打印收到的请求头(Authorization 脱敏) |
 | log.body | false | 打印请求 body 前 2KB |
 | log.tunnel | false | 透传 cloudflared 子进程输出(stdio inherit) |
+| log.upstreamErrors | true | 上游返回 4xx/5xx 时把错误体写入日志(截断 1000 字符),便于确诊 401/400 等 |
+| reasoning.replay | true | 回填缓存的 `reasoning_content`(方案 A,见「DeepSeek thinking 与 reasoning_content」) |
+| reasoning.fallbackDisabled | true | 400 时注入 `thinking=disabled` 重发一次(方案 B) |
+| reasoning.cacheTtlMs | 7200000 | reasoning 缓存存续期(毫秒) |
+| reasoning.maxEntries | 2000 | reasoning 缓存条目上限 |
 
 - 环境变量 `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` 可覆盖对应字段,热重载后依然生效
 - `auth.header` 与 `session.header` 不能相同(同名会覆盖上游 Authorization 头导致上游 401),无论鉴权是否开启都会在启动时拒绝

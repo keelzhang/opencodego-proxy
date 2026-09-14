@@ -158,10 +158,16 @@ test('buildUpstreamPath: reqPath 恰为 /v1 时前缀整段移除(固化 slice �
 });
 
 test('resolveSession: ttlMs=1 同毫秒内命中复用', () => {
-  const m = proxy.createSessionManager({ strategy: 'auto', header: 'x-opencode-session', staticId: 'sid', ttlMs: 1 });
-  const v1 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
-  const v2 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
-  assert.equal(v1, v2);
+  const realNow = Date.now;
+  Date.now = () => 1700000000000; // 冻结时钟:ttlMs=1 时若两次调用跨毫秒就会误报,冻结以确定性固化该边界语义
+  try {
+    const m = proxy.createSessionManager({ strategy: 'auto', header: 'x-opencode-session', staticId: 'sid', ttlMs: 1 });
+    const v1 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
+    const v2 = proxy.resolveSession(m, { 'x-session-id': 'fast' });
+    assert.equal(v1, v2);
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 // ---------- 任务 3:转发器与服务(端到端) ----------
@@ -906,6 +912,222 @@ test('buildTunnelArgs: configFile 为纯空白串时不加 --config', () => {
     proxy.buildTunnelArgs({ binary: 'cloudflared', name: 't', configFile: '   ', restartDelayMs: 5000 }),
     ['tunnel', 'run', 't'],
   );
+});
+
+// ---------- reasoning_content 回放(A)与降级(B) ----------
+// 背景:DeepSeek thinking mode 下请求带 tools 时,历史 assistant 必须回传 reasoning_content,否则上游 400。
+// Cursor 走 OpenAI 标准协议不保留该字段,故需要代理补(A)或降级(B)。
+
+const RCFG = { replay: true, fallbackDisabled: true, cacheTtlMs: 7200000, maxEntries: 100 };
+
+test('messageFingerprint: 容忍 tool_call id 与首尾空白,区分不同内容,空消息返回 null', () => {
+  const a = { role: 'assistant', content: 'hi', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] };
+  const b = { role: 'assistant', content: '  hi  ', tool_calls: [{ id: 'other-id', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] };
+  const c = { role: 'assistant', content: 'different', tool_calls: [] };
+  assert.equal(proxy.messageFingerprint(a), proxy.messageFingerprint(b)); // id/空白不影响
+  assert.notEqual(proxy.messageFingerprint(a), proxy.messageFingerprint(c));
+  assert.equal(proxy.messageFingerprint({ role: 'assistant', content: '' }), null); // 空消息无法关联
+  assert.equal(proxy.messageFingerprint({ role: 'user', content: 'x' }), null);
+});
+
+test('extractAssistantFromSse: 累积 reasoning_content 并重组分片 tool_calls', () => {
+  const sse = [
+    'data: {"choices":[{"delta":{"reasoning_content":"think "}}]}',
+    'data: {"choices":[{"delta":{"reasoning_content":"more"}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_","arguments":"{\\"pa"}}]}}]}',
+    'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\\":\\"a\\"}"}}]}}]}',
+    'data: [DONE]',
+    '',
+  ].join('\n');
+  const msg = proxy.extractAssistantFromSse(sse);
+  assert.equal(msg.reasoning_content, 'think more');
+  assert.deepEqual(msg.tool_calls, [{ type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }]);
+  assert.equal(proxy.extractAssistantFromSse('data: [DONE]\n'), null);
+});
+
+test('extractAssistantFromJson: 取 choices[0].message;非 JSON 返回 null', () => {
+  const msg = proxy.extractAssistantFromJson('{"choices":[{"message":{"role":"assistant","content":"x","reasoning_content":"rc"}}]}');
+  assert.equal(msg.reasoning_content, 'rc');
+  assert.equal(proxy.extractAssistantFromJson('not json'), null);
+});
+
+test('replayReasoning: 回填已缓存项;无 tools 或无非 JSON 时原样返回', () => {
+  const cache = proxy.createReasoningCache();
+  const upstreamMsg = { role: 'assistant', content: 'done', reasoning_content: 'RC-TEXT', tool_calls: [{ type: 'function', function: { name: 'grep', arguments: '{"p":"x"}' } }] };
+  assert.equal(proxy.rememberReasoning(cache, upstreamMsg, RCFG), true);
+
+  const clientMsg = { role: 'assistant', content: 'done', tool_calls: [{ type: 'function', function: { name: 'grep', arguments: '{"p":"x"}' } }] }; // 无 rc,模拟 Cursor
+  const reqWithTools = Buffer.from(JSON.stringify({ messages: [clientMsg], tools: [{ type: 'function', function: { name: 'grep' } }] }));
+  const r = proxy.replayReasoning(reqWithTools, cache, RCFG);
+  assert.equal(r.filled, 1);
+  assert.equal(JSON.parse(r.body.toString('utf8')).messages[0].reasoning_content, 'RC-TEXT');
+
+  const noTools = proxy.replayReasoning(Buffer.from(JSON.stringify({ messages: [clientMsg] })), cache, RCFG);
+  assert.equal(noTools.filled, 0);
+  assert.equal(noTools.body.toString('utf8'), JSON.stringify({ messages: [clientMsg] })); // 原样
+
+  const notJson = Buffer.from('not json');
+  assert.equal(proxy.replayReasoning(notJson, cache, RCFG).body, notJson); // 原样透传
+});
+
+test('replayReasoning: 未命中缓存时计入 missing(供告警观测)', () => {
+  const cache = proxy.createReasoningCache();
+  const body = Buffer.from(JSON.stringify({ messages: [{ role: 'assistant', content: 'x', tool_calls: [{ type: 'function', function: { name: 'f', arguments: '{}' } }] }], tools: [{ type: 'function', function: { name: 'f' } }] }));
+  const r = proxy.replayReasoning(body, cache, RCFG);
+  assert.equal(r.filled, 0);
+  assert.equal(r.missing, 1);
+});
+
+test('recallReasoning: 超过 cacheTtlMs 后不再命中', () => {
+  const cache = proxy.createReasoningCache();
+  const msg = { role: 'assistant', content: 'c', reasoning_content: 'rc' };
+  proxy.rememberReasoning(cache, msg, RCFG);
+  const fp = proxy.messageFingerprint(msg);
+  assert.equal(proxy.recallReasoning(cache, fp, RCFG), 'rc');
+  cache.entries.get(fp).createdAt -= RCFG.cacheTtlMs + 1; // 使其过期
+  assert.equal(proxy.recallReasoning(cache, fp, RCFG), null);
+});
+
+test('rememberReasoning: 超过 maxEntries 时淘汰最旧条目', () => {
+  const cache = proxy.createReasoningCache();
+  const small = { ...RCFG, maxEntries: 2 };
+  for (const n of ['a', 'b', 'c']) proxy.rememberReasoning(cache, { role: 'assistant', content: n, reasoning_content: 'rc-' + n }, small);
+  assert.equal(cache.entries.size, 2);
+  assert.equal(proxy.recallReasoning(cache, proxy.messageFingerprint({ role: 'assistant', content: 'a' }), small), null); // 最旧被淘汰
+});
+
+test('injectThinkingDisabled / looksLikeReasoningError', () => {
+  const out = proxy.injectThinkingDisabled(Buffer.from(JSON.stringify({ messages: [], tools: [] })));
+  assert.deepEqual(JSON.parse(out.toString('utf8')).thinking, { type: 'disabled' });
+  assert.equal(proxy.injectThinkingDisabled(Buffer.from('not json')), null); // 不可解析 → null
+  assert.equal(proxy.looksLikeReasoningError('The reasoning_content in the thinking mode must be passed back'), true);
+  assert.equal(proxy.looksLikeReasoningError('{"ok":true}'), false);
+  assert.equal(proxy.looksLikeReasoningError(undefined), false);
+});
+
+test('proxyRequest(B): 上游 400 提及 reasoning_content 时注入 thinking=disabled 重发一次', async (t) => {
+  const attempts = [];
+  const up = await startFakeUpstream((rq, rs) => {
+    let b = '';
+    rq.on('data', (c) => (b += c));
+    rq.on('end', () => {
+      const j = JSON.parse(b);
+      const disabled = !!(j.thinking && j.thinking.type === 'disabled');
+      attempts.push({ disabled, toolsKept: Array.isArray(j.tools) && j.tools.length > 0, model: j.model });
+      rs.writeHead(disabled ? 200 : 400, { 'content-type': 'application/json' });
+      rs.end(disabled ? '{"ok":true}' : JSON.stringify({ error: { message: 'The `reasoning_content` in the thinking mode must be passed back to the API.' } }));
+    });
+  });
+  const px = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false }, reasoning: RCFG });
+  t.after(() => closeSrv(px.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } },
+    JSON.stringify({ model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }], tools: [{ type: 'function', function: { name: 'x' } }] }));
+  assert.equal(res.status, 200);        // 客户端全程看不到 400
+  assert.equal(res.body, '{"ok":true}');
+  assert.equal(attempts.length, 2);     // 首次 + 重试
+  assert.equal(attempts[0].disabled, false);
+  assert.equal(attempts[1].disabled, true);
+  assert.equal(attempts[1].toolsKept, true); // 重试保留 tools
+  assert.equal(attempts[1].model, 'deepseek-v4-flash'); // 其余字段不变
+});
+
+test('proxyRequest(B): 与 reasoning 无关的 400 原样透传,不重试', async (t) => {
+  let hits = 0;
+  const up = await startFakeUpstream((rq, rs) => {
+    hits += 1;
+    rq.resume();
+    rs.writeHead(400, { 'content-type': 'application/json' });
+    rs.end('{"error":{"message":"some unrelated bad request"}}');
+  });
+  const px = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false }, reasoning: RCFG });
+  t.after(() => closeSrv(px.srv));
+  t.after(() => closeSrv(up.srv));
+  const res = await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } }, '{"model":"m","messages":[]}');
+  assert.equal(res.status, 400);
+  assert.equal(res.body, '{"error":{"message":"some unrelated bad request"}}'); // 原样
+  assert.equal(hits, 1); // 未重试
+});
+
+test('proxyRequest(A): 缓存上游 reasoning_content 并在下轮请求回填', async (t) => {
+  const rcText = 'Let me read the file first.';
+  const rcSeen = [];
+  const up = await startFakeUpstream((rq, rs) => {
+    let b = '';
+    rq.on('data', (c) => (b += c));
+    rq.on('end', () => {
+      const j = JSON.parse(b);
+      rcSeen.push((j.messages || []).filter((m) => m.role === 'assistant').map((m) => m.reasoning_content || null));
+      rs.writeHead(200, { 'content-type': 'application/json' });
+      if (rcSeen.length === 1) {
+        rs.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'done', reasoning_content: rcText, tool_calls: [{ type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] } }] }));
+      } else {
+        rs.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }));
+      }
+    });
+  });
+  const px = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false }, reasoning: RCFG });
+  t.after(() => closeSrv(px.srv));
+  t.after(() => closeSrv(up.srv));
+  // 第 1 轮:建立缓存
+  const r1 = await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } },
+    JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'go' }], tools: [{ type: 'function', function: { name: 'read_file' } }] }));
+  assert.equal(r1.status, 200);
+  // 第 2 轮:带上一轮的 assistant 消息但不含 reasoning_content(模拟 Cursor 行为)
+  const r2 = await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } },
+    JSON.stringify({ model: 'm', messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'done', tool_calls: [{ type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] },
+      { role: 'tool', tool_call_id: 't1', content: 'file body' },
+    ], tools: [{ type: 'function', function: { name: 'read_file' } }] }));
+  assert.equal(r2.status, 200);
+  assert.deepEqual(rcSeen[1], [rcText]); // 代理已把 reasoning_content 补回
+});
+
+test('proxyRequest: 上游 4xx 错误体写入日志(401 得以确诊),且响应仍原样透传', async (t) => {
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => {
+      rq.resume();
+      rs.writeHead(401, { 'content-type': 'application/json' });
+      rs.end('{"error":{"message":"invalid api key or subscription expired"}}');
+    });
+    const px = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false }, reasoning: RCFG });
+    t.after(() => closeSrv(px.srv));
+    t.after(() => closeSrv(up.srv));
+    const res = await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } }, '{}');
+    assert.equal(res.status, 401);
+    assert.equal(res.body, '{"error":{"message":"invalid api key or subscription expired"}}'); // 客户端仍拿到完整错误体
+  } finally {
+    console.warn = origWarn;
+  }
+  const all = warns.join('\n');
+  assert.ok(all.includes('[upstream] 401 body:'), 'should log the upstream error body for diagnosis');
+  assert.ok(all.includes('subscription expired'));
+});
+
+test('proxyRequest: log.upstreamErrors=false 时不打印上游错误体(仍原样透传)', async (t) => {
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    const up = await startFakeUpstream((rq, rs) => {
+      rq.resume();
+      rs.writeHead(500, { 'content-type': 'application/json' });
+      rs.end('{"error":{"message":"boom-secret"}}');
+    });
+    const px = await startProxy({ baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false, upstreamErrors: false }, reasoning: RCFG });
+    t.after(() => closeSrv(px.srv));
+    t.after(() => closeSrv(up.srv));
+    const res = await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } }, '{}');
+    assert.equal(res.status, 500);
+    assert.equal(res.body, '{"error":{"message":"boom-secret"}}');
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.ok(!warns.join('\n').includes('boom-secret'));
 });
 
 // ---------- 任务 5:隧道管理器 ----------

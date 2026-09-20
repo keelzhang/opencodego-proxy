@@ -20,6 +20,6 @@
     "staticId": "00000000-0000-4000-8000-000000000000",
     "ttlMs": 604800000
   },
-  "reasoning": { "replay": true, "fallbackDisabled": true, "cacheTtlMs": 7200000, "maxEntries": 2000 },
+  "reasoning": { "replay": false, "fallbackDisabled": true, "cacheTtlMs": 7200000, "maxEntries": 2000 },
   "log": { "headers": true, "body": false, "tunnel": false, "upstreamErrors": true }
 }

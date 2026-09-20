@@ -113,14 +113,14 @@ Why (per DeepSeek's [Thinking Mode](https://api-docs.deepseek.com/guides/thinkin
 - Whenever a request **carries the `tools` parameter**, every historical assistant message must send `reasoning_content` back, or the API returns 400.
 - Cursor speaks the standard OpenAI protocol and neither knows nor preserves that non-standard field, so the error becomes inevitable once enough tool-calling rounds accumulate (short sessions often work fine).
 
-The proxy handles this in two stages (both on by default):
+The proxy handles this in two stages (**by default: A off, B on**):
 
 | Option | Default | Effect |
 |---|---|---|
-| reasoning.replay | true | **A**: while the response streams through, extract `reasoning_content` out-of-band and cache it by assistant-message fingerprint, then fill it back into the next request. Cursor is unaffected; the cost is that the proxy must parse the body (unparseable bodies pass through untouched). |
+| reasoning.replay | **false** | **A**: while the response streams through, extract `reasoning_content` out-of-band and cache it by assistant-message fingerprint, then fill it back into the next request. **Off by default** — see "Why A is off by default" below. |
 | reasoning.fallbackDisabled | true | **B**: if a 400 still mentions `reasoning_content`, inject `thinking:{"type":"disabled"}` and retry once; the client just sees the successful response. The cost is losing thinking from that turn on. |
-| reasoning.cacheTtlMs | 7200000 | Cache lifetime (ms). |
-| reasoning.maxEntries | 2000 | Cache capacity; the oldest entry is evicted beyond it. |
+| reasoning.cacheTtlMs | 7200000 | Lifetime of A's cache (ms). |
+| reasoning.maxEntries | 2000 | Capacity of A's cache; the oldest entry is evicted beyond it. |
 
 The log prints `[reasoning] replayed …` (fill succeeded), `[reasoning] cached …`, `[reasoning] N assistant message(s) … lack cached` (cache miss, A failed) and `[reasoning] … retrying once with thinking=disabled` (fallback B). **Frequent cache-miss warnings** mean the client compacted the conversation history so the fingerprints no longer match: A fails and B takes over, which drops thinking for that session.
 
@@ -132,6 +132,18 @@ The log prints `[reasoning] replayed …` (fill succeeded), `[reasoning] cached 
 2. **Client-side compaction breaks the fingerprints**, as described above.
 
 In either case B takes over, at the cost of losing thinking for that session.
+
+#### Why A is off by default
+
+Beyond those two limits, A has a **side effect that disrupts normal conversation**: the filled-back `reasoning_content` is **concatenated into the context by the upstream** (DeepSeek's documented behaviour: "the `reasoning_content` of all previous turns should be passed back to the API and will be concatenated into the context"). The model therefore sees its own earlier reasoning chains and tends to continue that earlier line of thought — which shows up in Cursor as **jumping back to an earlier point in the conversation**.
+
+So only B is enabled by default (it only retries once when the upstream reports a 400, and never injects anything into the history). If a conversation genuinely needs thinking and you accept that side effect, turn A on explicitly:
+
+```json
+"reasoning": { "replay": true }
+```
+
+When A is off it **neither captures nor fills back** (both call sites in `proxyRequest` are gated on `cfg.reasoning.replay`), so the proxy falls back to pure pass-through and never parses the body for replay.
 
 ### Diagnosing upstream 401s (and other errors)
 
@@ -166,10 +178,10 @@ This matters: the proxy **passes error responses through without parsing them**,
 | log.body | false | Print the first 2 KB of the request body |
 | log.tunnel | false | Pass through cloudflared subprocess output (stdio inherit) |
 | log.upstreamErrors | true | Log the upstream error body on 4xx/5xx (truncated to 1000 chars), for diagnosing 401/400 |
-| reasoning.replay | true | Fill cached `reasoning_content` back (approach A; see "DeepSeek Thinking Mode and reasoning_content") |
+| reasoning.replay | false | Fill cached `reasoning_content` back (approach A). **Off by default**: the filled-back field is concatenated into context by the upstream, which makes the client jump back to an earlier point (see "Why A is off by default") |
 | reasoning.fallbackDisabled | true | Inject `thinking=disabled` and retry once on the 400 (approach B) |
-| reasoning.cacheTtlMs | 7200000 | Lifetime of the reasoning cache (ms) |
-| reasoning.maxEntries | 2000 | Capacity of the reasoning cache |
+| reasoning.cacheTtlMs | 7200000 | Lifetime of the reasoning cache (ms); only relevant when A is on |
+| reasoning.maxEntries | 2000 | Capacity of the reasoning cache; only relevant when A is on |
 
 - The environment variables `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` override the corresponding fields, and keep doing so after a hot reload
 - `auth.header` and `session.header` must not be the same (sharing a name would overwrite the upstream Authorization header and cause an upstream 401); this is rejected at startup whether or not auth is enabled
@@ -178,12 +190,13 @@ This matters: the proxy **passes error responses through without parsing them**,
 
 ## Upgrade Notes
 
-There are four behaviour changes worth noting in this version:
+There are five behaviour changes worth noting in this version:
 
 1. **The `auto` strategy gained a device-level fallback header.** When no session header is detected at all (which is exactly Cursor's situation), `cf-warp-tag-id` is used as the session key, so requests from the same device no longer get a fresh UUID each time but reuse one upstream session; when even that header is absent it still degrades to a fresh UUID per request. For the semantics and their source, see "Session Header and Session Strategy".
 2. **`session.ttlMs` changed from 2 hours to 7 days (`604800000`).** This value is the lifetime of the sliding window; going idle longer than it renews the injected session. The old 2 hours meant it was guaranteed to renew overnight, resetting the upstream's session routing / prompt caching to zero. The built-in code default is unchanged (still `7200000`); what changed is the `config.example.json` template and the local `config.json`. Adjust it longer or shorter as you like — `session.*` takes effect on save via hot reload. Note that it **cannot fix renewal caused by a process restart** (the mapping table lives in memory); see "Lifetime of the Mapping Table" for details.
 3. **`auth.header` and `session.header` must not be the same.** If an old config set both to the same field (for example both `x-opencode-session`), startup is rejected with `config: auth.header and session.header must differ`. The reason is that `proxyRequest` unconditionally writes `headers['authorization'] = Bearer <upstream apiKey>`, and if `headers[session.header] = <sessionId>` shares that name it overwrites the upstream auth header, causing an upstream 401. Set `session.header` back to `x-opencode-session` (the default) or pick another non-conflicting name.
 4. **Cursor's Base URL can no longer be `http://127.0.0.1:8787/v1`.** That approach has been verified unusable: Cursor's BYOK requests are issued by Cursor's servers, whose SSRF protection rejects private network ranges and returns `403 Access to private networks is forbidden`. Use the public HTTPS address exposed by the cloudflared named tunnel instead; see "Public Endpoint".
+5. **`reasoning.replay` (approach A) is now off by default.** It fills back cached `reasoning_content`, and that field is **concatenated into the context by the upstream** (DeepSeek's documented behaviour), which makes the model continue its earlier reasoning — showing up in Cursor as **jumping back to an earlier point in the conversation**. Only B (`reasoning.fallbackDisabled`, a single retry on the 400, injecting nothing into the history) stays on by default. If you genuinely need thinking and accept that side effect, turn A on explicitly with `"reasoning": { "replay": true }`. See "Why A is off by default".
 
 ## Tests
 

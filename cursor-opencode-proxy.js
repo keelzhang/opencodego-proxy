@@ -38,7 +38,9 @@ function loadConfig(file, env = process.env) {
     auth: { enabled: false, header: 'authorization', token: '' },
     tunnel: { enabled: false, binary: 'cloudflared', name: 'cursor-proxy', configFile: '', restartDelayMs: 5000 },
     session: { strategy: 'auto', header: 'x-opencode-session', staticId: '00000000-0000-4000-8000-000000000000', ttlMs: 7200000 },
-    reasoning: { replay: true, fallbackDisabled: true, cacheTtlMs: 7200000, maxEntries: 2000 },
+    // A(replay)默认关:回填 reasoning_content 会被上游拼进上下文,使模型偏向早前推理,Cursor 侧表现为“跳回之前的对话进度”。需要时显式开启。
+    // B(fallbackDisabled)默认开:仅在上游 400 提及 reasoning_content 时降级重发一次,不往历史里注入任何内容。
+    reasoning: { replay: false, fallbackDisabled: true, cacheTtlMs: 7200000, maxEntries: 2000 },
     log: { headers: true, body: false, tunnel: false, upstreamErrors: true },
   };
   const missing = [];
@@ -484,8 +486,8 @@ function looksLikeReasoningError(text) {
 }
 
 function createHotReloader(cfg) {
-  // 兜底:测试与外部调用可能直接构造 cfg(不经 loadConfig)。缺省视为关闭两项新能力,保持"纯透传"语义。
-  if (!cfg.reasoning) cfg.reasoning = { replay: false, fallbackDisabled: false, cacheTtlMs: 7200000, maxEntries: 2000 };
+  // 兜底:测试与外部调用可能直接构造 cfg(不经 loadConfig)。与 loadConfig 默认保持一致:A 关、B 开。
+  if (!cfg.reasoning) cfg.reasoning = { replay: false, fallbackDisabled: true, cacheTtlMs: 7200000, maxEntries: 2000 };
   return { config: cfg, sessionMgr: createSessionManager(cfg.session), reasoningCache: createReasoningCache() };
 }
 

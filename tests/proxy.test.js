@@ -920,6 +920,45 @@ test('buildTunnelArgs: configFile 为纯空白串时不加 --config', () => {
 
 const RCFG = { replay: true, fallbackDisabled: true, cacheTtlMs: 7200000, maxEntries: 100 };
 
+test('默认配置:A(replay)关闭、B(fallbackDisabled)开启', () => {
+  const cfg = proxy.loadConfig(makeConfigFile({ baseUrl: 'https://api.example.com/v4', apiKey: 'k' }), {});
+  assert.equal(cfg.reasoning.replay, false);          // A 有副作用(上游会把回填的 reasoning 拼进上下文,客户端表现为跳回进度),默认关
+  assert.equal(cfg.reasoning.fallbackDisabled, true); // B 仅是 400 救援,不改写历史,默认开
+  // 直接构造 cfg(不经 loadConfig)时的兜底也必须与之一致
+  const hot = proxy.createHotReloader({ session: { strategy: 'auto', header: 'h', staticId: 's', ttlMs: 1000 } });
+  assert.equal(hot.config.reasoning.replay, false);
+  assert.equal(hot.config.reasoning.fallbackDisabled, true);
+});
+
+test('proxyRequest(A 关闭):即使上游返回 reasoning_content 也不回填(纯透传)', async (t) => {
+  const rcSeen = [];
+  const up = await startFakeUpstream((rq, rs) => {
+    let b = '';
+    rq.on('data', (c) => (b += c));
+    rq.on('end', () => {
+      const j = JSON.parse(b);
+      rcSeen.push((j.messages || []).filter((m) => m.role === 'assistant').map((m) => m.reasoning_content || null));
+      rs.writeHead(200, { 'content-type': 'application/json' });
+      rs.end(JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'done', reasoning_content: 'SHOULD-NOT-BE-REPLAYED', tool_calls: [{ type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] } }] }));
+    });
+  });
+  const px = await startProxy({
+    baseUrl: `http://127.0.0.1:${up.port}`, apiKey: 'k', session: VALID.session, log: { headers: false, body: false },
+    reasoning: { ...RCFG, replay: false }, // 只关 A
+  });
+  t.after(() => closeSrv(px.srv));
+  t.after(() => closeSrv(up.srv));
+  await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } },
+    JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'go' }], tools: [{ type: 'function', function: { name: 'read_file' } }] }));
+  await req(px.port, { method: 'POST', path: '/v1/chat/completions', headers: { 'content-type': 'application/json' } },
+    JSON.stringify({ model: 'm', messages: [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'done', tool_calls: [{ type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] },
+      { role: 'tool', tool_call_id: 't1', content: 'file body' },
+    ], tools: [{ type: 'function', function: { name: 'read_file' } }] }));
+  assert.deepEqual(rcSeen[1], [null]); // 第 2 轮上游收到的 assistant 仍无 reasoning_content
+});
+
 test('messageFingerprint: 容忍 tool_call id 与首尾空白,区分不同内容,空消息返回 null', () => {
   const a = { role: 'assistant', content: 'hi', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] };
   const b = { role: 'assistant', content: '  hi  ', tool_calls: [{ id: 'other-id', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] };

@@ -113,14 +113,14 @@ Error from provider (Console Go): Upstream request failed:
 - 只要请求**带 `tools` 参数**,历史每一轮 assistant 消息都必须回传 `reasoning_content`,否则返回 400;
 - 而 Cursor 走标准 OpenAI 协议,**不认识也不保留**这个非标准字段,故多轮工具调用累积到一定规模后必然触发(短会话可能一直正常)。
 
-代理提供两级处置(默认都开):
+代理提供两级处置(**默认:A 关、B 开**):
 
 | 配置 | 默认 | 作用 |
 |---|---|---|
-| reasoning.replay | true | **A**:透传响应时旁路提取 `reasoning_content` 并按 assistant 消息指纹缓存,下次请求回填。Cursor 侧无感,代价是代理需解析 body(解析失败自动原样透传)。 |
+| reasoning.replay | **false** | **A**:透传响应时旁路提取 `reasoning_content` 并按 assistant 消息指纹缓存,下次请求回填。**默认关**——见下方「为何 A 默认关闭」。 |
 | reasoning.fallbackDisabled | true | **B**:若仍收到 400 且错误体提及 `reasoning_content`,自动注入 `thinking:{"type":"disabled"}` 重发一次,成功后客户端无感。代价是该轮起失去 thinking。 |
-| reasoning.cacheTtlMs | 7200000 | 缓存存续期(毫秒)。 |
-| reasoning.maxEntries | 2000 | 缓存条目上限,超出淘汰最旧。 |
+| reasoning.cacheTtlMs | 7200000 | A 的缓存存续期(毫秒)。 |
+| reasoning.maxEntries | 2000 | A 的缓存条目上限,超出淘汰最旧。 |
 
 日志会打印 `[reasoning] replayed …`(回填成功)、`[reasoning] cached …`(缓存成功)、`[reasoning] N assistant message(s) … lack cached`(未命中,A 失效)与 `[reasoning] … retrying once with thinking=disabled`(降级 B)。**未命中告警频繁出现**说明会话历史被客户端压缩(compaction)、指纹对不上——此时 A 失效而由 B 兜底,该会话会失去 thinking。
 
@@ -132,6 +132,18 @@ Error from provider (Console Go): Upstream request failed:
 2. **客户端压缩(compaction)会使指纹失配**,见上。
 
 两种情况都有 B 兜底,代价是该会话失去 thinking。
+
+#### 为何 A 默认关闭
+
+除了上述两个局限,A 还有一个**会干扰正常对话的副作用**:回填的 `reasoning_content` 会被上游**拼进上下文**(DeepSeek 官方行为:「the `reasoning_content` of all previous turns should be passed back to the API and will be concatenated into the context」)。于是模型会看到自己前几轮的推理链,回答倾向于延续早前那一段思路——在 Cursor 里表现为**跳回到之前的对话进度**。
+
+因此默认只保留 B(它只在上游报 400 时降级重发一次,不向历史注入任何内容)。若你的会话确实需要 thinking 且能接受上述副作用,再显式开启:
+
+```json
+"reasoning": { "replay": true }
+```
+
+A 关闭时**既不采集也不回填**(`proxyRequest` 里两处都由 `cfg.reasoning.replay` 门控),完全退回纯透传,不会为回放而解析 body。
 
 ### 上游 401 / 其它错误如何确诊
 
@@ -166,10 +178,10 @@ Error from provider (Console Go): Upstream request failed:
 | log.body | false | 打印请求 body 前 2KB |
 | log.tunnel | false | 透传 cloudflared 子进程输出(stdio inherit) |
 | log.upstreamErrors | true | 上游返回 4xx/5xx 时把错误体写入日志(截断 1000 字符),便于确诊 401/400 等 |
-| reasoning.replay | true | 回填缓存的 `reasoning_content`(方案 A,见「DeepSeek thinking 与 reasoning_content」) |
+| reasoning.replay | false | 回填缓存的 `reasoning_content`(方案 A)。**默认关**:回填会被上游拼进上下文,导致客户端跳回早前进度(见「为何 A 默认关闭」) |
 | reasoning.fallbackDisabled | true | 400 时注入 `thinking=disabled` 重发一次(方案 B) |
-| reasoning.cacheTtlMs | 7200000 | reasoning 缓存存续期(毫秒) |
-| reasoning.maxEntries | 2000 | reasoning 缓存条目上限 |
+| reasoning.cacheTtlMs | 7200000 | reasoning 缓存存续期(毫秒),仅 A 开启时生效 |
+| reasoning.maxEntries | 2000 | reasoning 缓存条目上限,仅 A 开启时生效 |
 
 - 环境变量 `COP_PORT` / `COP_BASE_URL` / `COP_API_KEY` / `COP_AUTH_TOKEN` 可覆盖对应字段,热重载后依然生效
 - `auth.header` 与 `session.header` 不能相同(同名会覆盖上游 Authorization 头导致上游 401),无论鉴权是否开启都会在启动时拒绝
@@ -178,12 +190,13 @@ Error from provider (Console Go): Upstream request failed:
 
 ## 升级注意
 
-本版本有四处行为变化值得注意:
+本版本有五处行为变化值得注意:
 
 1. **`auto` 策略新增设备级兜底头。** 当一个会话头都探测不到时(正是 Cursor 的实况),改用 `cf-warp-tag-id` 作为会话键,于是同一设备的请求不再每请求新 UUID,而是复用同一个上游 session;连该头也没有时仍降级为每请求新 UUID。语义与出处见「会话头与 session 策略」。
 2. **`session.ttlMs` 的取值由 2 小时改为 7 天(`604800000`)。** 该值是滑动窗口的存续期,停用超过它就会换新注入的 session;原 2 小时意味着隔夜后必然换新,使上游的 session routing / prompt caching 归零。代码内置默认未变(仍为 `7200000`),改的是 `config.example.json` 模板与本地 `config.json`;需要更长或更短可自行调整,`session.*` 保存即热重载。注意它**解决不了进程重启导致的换新**(映射表在内存中),详见「映射表的生命周期」。
 3. **`auth.header` 与 `session.header` 不能同名。** 若旧配置把两者配成同一个字段(例如都为 `x-opencode-session`),启动会被拒绝并报 `config: auth.header and session.header must differ`。原因是 `proxyRequest` 会无条件写入 `headers['authorization'] = Bearer <上游 apiKey>`,随后 `headers[session.header] = <sessionId>` 若与之同名会覆盖上游鉴权头,导致上游 401。请把 `session.header` 改回 `x-opencode-session`(默认值)或另选一个不冲突的名字。
 4. **Cursor 的 Base URL 不能再填 `http://127.0.0.1:8787/v1`。** 该做法经查实不可用:Cursor 的 BYOK 请求由 Cursor 服务端代发,其 SSRF 防护会拒绝私有网段并返回 `403 Access to private networks is forbidden`。须改用 cloudflared 命名隧道暴露的公网 HTTPS 地址,见「公网接入」。
+5. **`reasoning.replay`(方案 A)默认关闭。** 它会回填缓存的 `reasoning_content`,而该字段会被上游**拼进上下文**(DeepSeek 官方行为),使模型延续早前推理——在 Cursor 里表现为**跳回之前的对话进度**。因此默认只保留 B(`reasoning.fallbackDisabled`,仅 400 时降级重发一次,不注入历史)。确实需要 thinking 且能接受该副作用时,显式设 `"reasoning": { "replay": true }` 开启。详见「为何 A 默认关闭」。
 
 ## 测试
 
